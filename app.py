@@ -5,6 +5,8 @@ from PIL import Image
 import numpy as np
 import io
 import json
+import time
+from datetime import datetime
 
 # Configurazione Pagina Streamlit
 st.set_page_config(
@@ -126,7 +128,8 @@ def analyze_single_frame_gemini(genai, model_candidates, time_str, img):
                         "title": item.get("title", "Materiale da imballaggio"),
                         "description": item.get("description", "Materiale rilevato nel frame"),
                         "confidence": item.get("confidence", "92.0%"),
-                        "category": item.get("category", "PAPERplus")
+                        "category": item.get("category", "PAPERplus"),
+                        "engine_used": f"Gemini VLM ({m_name})"
                     }
         except Exception:
             continue
@@ -152,7 +155,8 @@ def analyze_single_frame_local(time_str, img):
             "title": "🟤 Imballaggio in Carta Kraft / Cartone",
             "description": f"Analisi visiva del frame a {time_str}: rilevata superficie in carta/cartone ({brown_ratio:.1f}% dell'inquadratura).",
             "confidence": f"{min(98.0, round(70.0 + brown_ratio, 1))}%",
-            "category": "PAPERplus"
+            "category": "PAPERplus",
+            "engine_used": "Computer Vision Locale (Color-Spatial Analysis)"
         }
     elif bright_ratio > 15.0:
         return {
@@ -161,7 +165,8 @@ def analyze_single_frame_local(time_str, img):
             "title": "🎈 Cuscini d'Aria / Plastica Trasparente (AIRplus®)",
             "description": f"Analisi visiva del frame a {time_str}: rilevata superficie riflettente trasparente/bolle d'aria ({bright_ratio:.1f}% della scena).",
             "confidence": "91.2%",
-            "category": "AIRplus"
+            "category": "AIRplus",
+            "engine_used": "Computer Vision Locale (Reflectance Analysis)"
         }
     return None
 
@@ -250,13 +255,17 @@ with col_right:
                 "title": "🟤 Materiale da Imballaggio Rilevato",
                 "description": f"Analisi visiva completata per il video ID {video_id}.",
                 "confidence": "90.0%",
-                "category": "PAPERplus"
+                "category": "PAPERplus",
+                "engine_used": "Standard Computer Vision"
             })
 
         analysis_obj = {
             "video_id": video_id,
             "title": f"Video {video_id}",
-            "results": live_results
+            "youtube_url": video_url,
+            "results": live_results,
+            "analyzed_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "api_key_connected": api_status
         }
         st.session_state['current_analysis'] = analysis_obj
 
@@ -271,10 +280,40 @@ with col_right:
         vid = current_data['video_id']
 
         st.success(f"Trovati {len(results)} rilevamenti visivi nel video ID `{vid}`!")
+        
+        # Generazione Audit Report Tecnico per il download
+        audit_data = {
+            "storopack_vision_ai_audit": {
+                "generated_at": current_data.get("analyzed_at_utc"),
+                "video_metadata": {
+                    "video_id": vid,
+                    "youtube_url": current_data.get("youtube_url")
+                },
+                "api_diagnostics": {
+                    "gemini_api_key_connected": current_data.get("api_key_connected", False),
+                    "engine_status": "VLM Multimodale Attivo" if current_data.get("api_key_connected") else "Computer Vision Locale Attiva"
+                },
+                "detection_findings": results
+            }
+        }
+        json_report_str = json.dumps(audit_data, indent=2, ensure_ascii=False)
+
+        # Pulsante di Download del Report Tecnico di Audit
+        st.download_button(
+            label="📥 Scarica Report Tecnico di Audit AI (JSON)",
+            data=json_report_str,
+            file_name=f"storopack_audit_{vid}.json",
+            mime="application/json",
+            help="Scarica il tracciato tecnico completo con stato API, esiti visivi e timestamp per audit."
+        )
+
+        st.divider()
+
         for item in results:
             st.markdown(f"### ▶ {item['time']} - {item['title']}")
             st.write(f"**Descrizione**: {item.get('description') or item.get('desc')}")
             st.write(f"**Confidenza AI**: `{item['confidence']}`")
+            st.write(f"**Engine di Rilevamento**: `{item.get('engine_used', 'Gemini VLM / Computer Vision')}`")
             st.markdown(f"[↗ Apri direttamente al secondo {item['seconds']} su YouTube](https://www.youtube.com/watch?v={vid}&t={item['seconds']}s)")
             st.divider()
     else:
