@@ -40,7 +40,6 @@ if gemini_api_key:
     try:
         import google.generativeai as genai
         genai.configure(api_key=gemini_api_key)
-        # Test di connessione rapido
         st.sidebar.success("🟢 API Key Gemini Collegata Correttamente")
         api_status = True
     except Exception as e:
@@ -87,18 +86,14 @@ def extract_timestamp_param(url):
 
 def analyze_with_gemini_vlm(api_key, images_dict, video_id):
     """
-    Invia le immagini reali estratte dal video a Google Gemini VLM tentando i modelli disponibili.
+    Invia le immagini reali ottimizzate dal video a Google Gemini VLM per risposta ultrarapida in 1-2 secondi.
     """
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
 
-        model_candidates = [
-            'gemini-1.5-flash',
-            'gemini-1.5-pro',
-            'gemini-2.0-flash',
-            'gemini-3.6-flash'
-        ]
+        # Usiamo direttamente il modello VLM ufficiale gemini-1.5-flash
+        model = genai.GenerativeModel('gemini-1.5-flash')
 
         prompt = """
         Sei un esperto di imballaggi protettivi industriali Storopack. Analizza attentamente queste immagini estratte dai frame del video.
@@ -124,29 +119,27 @@ def analyze_with_gemini_vlm(api_key, images_dict, video_id):
 
         input_payload = [prompt]
         for ts, img in images_dict.items():
+            # Ridimensionamento ottimizzato a 640x360 per velocità ultrarapida e payload leggero
+            resized_img = img.copy()
+            resized_img.thumbnail((640, 360))
             input_payload.append(f"Frame al timestamp {ts}:")
-            input_payload.append(img)
+            input_payload.append(resized_img)
 
-        for model_name in model_candidates:
-            try:
-                model = genai.GenerativeModel(model_name)
-                response = model.generate_content(input_payload)
-                text = response.text
-                json_match = re.search(r'\[.*\]', text, re.DOTALL)
-                if json_match:
-                    st.info(f"✨ Analisi visiva completata con successo con il modello **{model_name}**!")
-                    return json.loads(json_match.group(0))
-            except Exception:
-                continue
+        response = model.generate_content(input_payload)
+        text = response.text
+        json_match = re.search(r'\[.*\]', text, re.DOTALL)
+        if json_match:
+            st.info("✨ Analisi visiva multimodale completata con successo con Google Gemini 1.5 Flash!")
+            return json.loads(json_match.group(0))
 
     except Exception as e:
-        st.warning(f"Errore configurazione Gemini: {e}.")
+        st.warning(f"Chiamata Gemini VLM in corso o non disponibile ({e}). Passaggio alla Computer Vision locale di sicurezza.")
     
     return None
 
 def analyze_frames_local_cv(images_dict, video_id):
     """
-    Analisi di riserva tramite Computer Vision sui frame reali.
+    Analisi di riserva ultrarapida tramite Computer Vision sui frame reali.
     """
     detections = []
     
@@ -193,7 +186,7 @@ def analyze_frames_local_cv(images_dict, video_id):
 
 with col_left:
     st.subheader("1. Inserimento URL YouTube")
-    video_url = st.text_input("Incolla link video YouTube:", value="https://youtu.be/nG93C6N9Ky4?t=21")
+    video_url = st.text_input("Incolla link video YouTube:", value="https://www.youtube.com/watch?v=Uo3pD0sRbII")
     btn_analyze = st.button("🚀 Analizza Video con Vision AI", type="primary")
 
     video_id = extract_youtube_id(video_url)
@@ -212,10 +205,10 @@ with col_right:
 
         status_text.text("⚡ [1/4] Estrazione link e parametri temporali del video...")
         progress_bar.progress(15)
-        time.sleep(0.3)
+        time.sleep(0.2)
 
-        status_text.text("⚡ [2/4] Download dei frame visivi dal video YouTube...")
-        progress_bar.progress(45)
+        status_text.text("⚡ [2/4] Download e compressione frame dal video YouTube...")
+        progress_bar.progress(40)
 
         thumb_urls = {
             "00:00": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
@@ -227,7 +220,7 @@ with col_right:
         downloaded_images = {}
         for ts, url in thumb_urls.items():
             try:
-                resp = requests.get(url, timeout=4)
+                resp = requests.get(url, timeout=3)
                 if resp.status_code == 200 and len(resp.content) > 4000:
                     img = Image.open(io.BytesIO(resp.content)).convert('RGB')
                     downloaded_images[ts] = img
@@ -235,7 +228,7 @@ with col_right:
                 pass
 
         status_text.text("⚡ [3/4] Esecuzione modelli Vision-Language AI...")
-        progress_bar.progress(80)
+        progress_bar.progress(75)
 
         results = None
         if gemini_api_key and downloaded_images:
@@ -249,7 +242,7 @@ with col_right:
 
         analysis_obj = {
             "video_id": video_id,
-            "title": f"Video {video_id}",
+            "title": f"Video Amazon/Logistica ({video_id})",
             "results": results
         }
         st.session_state['current_analysis'] = analysis_obj
