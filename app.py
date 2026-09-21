@@ -86,14 +86,31 @@ def extract_timestamp_param(url):
 
 def analyze_with_gemini_vlm(api_key, images_dict, video_id):
     """
-    Invia le immagini reali ottimizzate dal video a Google Gemini VLM per risposta ultrarapida in 1-2 secondi.
+    Invia le immagini reali al modello Gemini attivo (3.6-flash, 3.5-flash, ecc.) cercando automaticamente tra i modelli disponibili.
     """
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
 
-        # Usiamo direttamente il modello VLM ufficiale gemini-1.5-flash
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # 1. Trova i modelli attivi per l'API Key che supportano la visione/generateContent
+        available_model_names = []
+        try:
+            for m in genai.list_models():
+                if 'generateContent' in m.supported_generation_methods:
+                    available_model_names.append(m.name)
+        except Exception:
+            pass
+
+        # 2. Modelli preferiti in ordine di priorità
+        preferred = [
+            'models/gemini-3.6-flash', 'gemini-3.6-flash',
+            'models/gemini-3.5-flash', 'gemini-3.5-flash',
+            'models/gemini-1.5-flash-latest', 'gemini-1.5-flash-latest',
+            'models/gemini-2.0-flash', 'gemini-2.0-flash',
+            'models/gemini-1.5-flash', 'gemini-1.5-flash'
+        ]
+
+        model_candidates = preferred + [m for m in available_model_names if m not in preferred]
 
         prompt = """
         Sei un esperto di imballaggi protettivi industriali Storopack. Analizza attentamente queste immagini estratte dai frame del video.
@@ -119,22 +136,26 @@ def analyze_with_gemini_vlm(api_key, images_dict, video_id):
 
         input_payload = [prompt]
         for ts, img in images_dict.items():
-            # Ridimensionamento ottimizzato a 640x360 per velocità ultrarapida e payload leggero
             resized_img = img.copy()
             resized_img.thumbnail((640, 360))
             input_payload.append(f"Frame al timestamp {ts}:")
             input_payload.append(resized_img)
 
-        response = model.generate_content(input_payload)
-        text = response.text
-        json_match = re.search(r'\[.*\]', text, re.DOTALL)
-        if json_match:
-            st.info("✨ Analisi visiva multimodale completata con successo con Google Gemini 1.5 Flash!")
-            return json.loads(json_match.group(0))
+        for m_name in model_candidates:
+            try:
+                model = genai.GenerativeModel(m_name)
+                response = model.generate_content(input_payload)
+                text = response.text
+                json_match = re.search(r'\[.*\]', text, re.DOTALL)
+                if json_match:
+                    st.info(f"✨ Analisi visiva multimodale completata con successo con il modello **{m_name}**!")
+                    return json.loads(json_match.group(0))
+            except Exception:
+                continue
 
     except Exception as e:
-        st.warning(f"Chiamata Gemini VLM in corso o non disponibile ({e}). Passaggio alla Computer Vision locale di sicurezza.")
-    
+        st.warning(f"Chiamata Gemini VLM ({e}). Passaggio alla Computer Vision locale.")
+
     return None
 
 def analyze_frames_local_cv(images_dict, video_id):
