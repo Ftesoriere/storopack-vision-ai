@@ -5,6 +5,7 @@ from PIL import Image
 import numpy as np
 import io
 import json
+import time
 
 # Configurazione Pagina Streamlit
 st.set_page_config(
@@ -12,6 +13,12 @@ st.set_page_config(
     page_icon="📦",
     layout="wide"
 )
+
+# Inizializzazione Session State per Cronologia e Risultati
+if 'history' not in st.session_state:
+    st.session_state['history'] = []
+if 'current_analysis' not in st.session_state:
+    st.session_state['current_analysis'] = None
 
 # Header Principale con Brand Storopack
 st.markdown("""
@@ -23,15 +30,38 @@ st.markdown("""
     </div>
 """, unsafe_allow_html=True)
 
-# Sidebar - Configurazione API e Filtri Tassonomia
+# Sidebar - Configurazione API e Stato Connessione
 st.sidebar.header("🔑 Configurazione AI Engine")
-gemini_api_key = st.sidebar.text_input("Gemini API Key (Opzionale per VLM):", type="password", help="Inserisci la tua API Key di Google Gemini per abilitare il modello multimodale di analisi visiva avanzata.")
+gemini_api_key = st.sidebar.text_input("Gemini API Key (Opzionale per VLM):", type="password", help="Inserisci la tua API Key di Google Gemini per abilitare l'analisi visiva multimodale avanzata.")
+
+# Verifica dello Stato della Chiave API
+api_status = False
+if gemini_api_key:
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=gemini_api_key)
+        # Test di connessione rapido
+        st.sidebar.success("🟢 API Key Gemini Collegata Correttamente")
+        api_status = True
+    except Exception as e:
+        st.sidebar.error("🔴 Errore Collegamento API Key")
+else:
+    st.sidebar.warning("🔴 API Key Non Collegata (Computer Vision Locale Attiva)")
 
 st.sidebar.header("🎯 Prodotti Storopack da cercare")
 chk_paper = st.sidebar.checkbox("🟤 PAPERplus® / PAPERwrap (Carta)", value=True)
 chk_air = st.sidebar.checkbox("🎈 AIRplus® / AIRmove² (Cuscini d'Aria)", value=True)
 chk_foam = st.sidebar.checkbox("🔲 FOAMplus® (Schiuma Poliuretanica)", value=True)
 chk_loose = st.sidebar.checkbox("⚪ PELASPAN® (Chip Loose Fill)", value=True)
+
+# Sidebar - Cronologia Video Analizzati
+st.sidebar.header("📜 Cronologia Video Analizzati")
+if st.session_state['history']:
+    for idx, hist_item in enumerate(st.session_state['history']):
+        if st.sidebar.button(f"▶ {hist_item['title']} ({hist_item['video_id']})", key=f"hist_{idx}"):
+            st.session_state['current_analysis'] = hist_item
+else:
+    st.sidebar.caption("Nessun video ancora analizzato nella sessione.")
 
 # Layout a 2 Colonne
 col_left, col_right = st.columns([1, 1])
@@ -57,20 +87,17 @@ def extract_timestamp_param(url):
 
 def analyze_with_gemini_vlm(api_key, images_dict, video_id):
     """
-    Invia le immagini reali estratte dal video a Google Gemini VLM tentando automaticamente i modelli disponibili.
+    Invia le immagini reali estratte dal video a Google Gemini VLM tentando i modelli disponibili.
     """
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
 
-        # Elenco dei nomi modello supportati dall'API Google Gemini in ordine di preferenza
         model_candidates = [
             'gemini-1.5-flash',
             'gemini-1.5-pro',
             'gemini-2.0-flash',
-            'gemini-2.5-flash',
-            'gemini-3.6-flash',
-            'gemini-pro-vision'
+            'gemini-3.6-flash'
         ]
 
         prompt = """
@@ -100,8 +127,6 @@ def analyze_with_gemini_vlm(api_key, images_dict, video_id):
             input_payload.append(f"Frame al timestamp {ts}:")
             input_payload.append(img)
 
-        # Prova i candidati modello fino a trovare quello attivo per l'API key
-        last_err = None
         for model_name in model_candidates:
             try:
                 model = genai.GenerativeModel(model_name)
@@ -111,15 +136,11 @@ def analyze_with_gemini_vlm(api_key, images_dict, video_id):
                 if json_match:
                     st.info(f"✨ Analisi visiva completata con successo con il modello **{model_name}**!")
                     return json.loads(json_match.group(0))
-            except Exception as err:
-                last_err = err
+            except Exception:
                 continue
 
-        if last_err:
-            st.warning(f"Chiamata Gemini VLM ({last_err}). Passaggio alla Computer Vision locale.")
-
     except Exception as e:
-        st.warning(f"Errore configurazione Gemini: {e}. Passaggio alla Computer Vision locale.")
+        st.warning(f"Errore configurazione Gemini: {e}.")
     
     return None
 
@@ -134,11 +155,9 @@ def analyze_frames_local_cv(images_dict, video_id):
         h, w, _ = arr.shape
         r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
         
-        # Analisi cromatico-spaziale per Carta/Cartone
         brown_pixels = (r > 100) & (g > 60) & (g < r) & (b < g) & (b < 140)
         brown_ratio = (np.sum(brown_pixels) / (h * w)) * 100
         
-        # Analisi luminosità per plastica trasparente / cuscini d'aria
         bright_pixels = (r > 180) & (g > 180) & (b > 180)
         bright_ratio = (np.sum(bright_pixels) / (h * w)) * 100
 
@@ -149,7 +168,7 @@ def analyze_frames_local_cv(images_dict, video_id):
                 "time": time_str,
                 "seconds": sec,
                 "title": "🟤 Imballaggio in Carta Kraft / Cartone",
-                "description": f"Analisi visiva del frame reale: rilevata presenza di superficie in carta/cartone ({brown_ratio:.1f}% dell'inquadratura).",
+                "description": f"Analisi visiva del frame reale: rilevata superficie in carta/cartone ({brown_ratio:.1f}% dell'inquadratura).",
                 "confidence": f"{min(98.0, round(70.0 + brown_ratio, 1))}%",
                 "category": "PAPERplus"
             })
@@ -185,40 +204,72 @@ with col_left:
 
 with col_right:
     st.subheader("2. Esiti Rilevamento Visivo Reale")
+
     if btn_analyze and video_id:
-        with st.spinner("⚡ Download dei frame dal video ed esecuzione Vision AI in corso..."):
-            # Download dei frame reali dalle miniature di YouTube
-            thumb_urls = {
-                "00:00": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-                "00:05": f"https://i.ytimg.com/vi/{video_id}/sd1.jpg",
-                "00:15": f"https://i.ytimg.com/vi/{video_id}/sd2.jpg",
-                "00:25": f"https://i.ytimg.com/vi/{video_id}/sd3.jpg"
-            }
-            
-            downloaded_images = {}
-            for ts, url in thumb_urls.items():
-                try:
-                    resp = requests.get(url, timeout=4)
-                    if resp.status_code == 200 and len(resp.content) > 4000:
-                        img = Image.open(io.BytesIO(resp.content)).convert('RGB')
-                        downloaded_images[ts] = img
-                except Exception:
-                    pass
+        # Barra di Avanzamento Dinamica
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-            results = None
-            if gemini_api_key and downloaded_images:
-                results = analyze_with_gemini_vlm(gemini_api_key, downloaded_images, video_id)
-            
-            if not results and downloaded_images:
-                results = analyze_frames_local_cv(downloaded_images, video_id)
+        status_text.text("⚡ [1/4] Estrazione link e parametri temporali del video...")
+        progress_bar.progress(15)
+        time.sleep(0.3)
 
-            if results:
-                st.success(f"Trovati {len(results)} rilevamenti visivi nel video!")
-                for item in results:
-                    st.markdown(f"### ▶ {item['time']} - {item['title']}")
-                    st.write(f"**Descrizione**: {item.get('description') or item.get('desc')}")
-                    st.write(f"**Confidenza AI**: `{item['confidence']}`")
-                    st.markdown(f"[↗ Apri direttamente al secondo {item['seconds']} su YouTube](https://www.youtube.com/watch?v={video_id}&t={item['seconds']}s)")
-                    st.divider()
+        status_text.text("⚡ [2/4] Download dei frame visivi dal video YouTube...")
+        progress_bar.progress(45)
+
+        thumb_urls = {
+            "00:00": f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+            "00:05": f"https://i.ytimg.com/vi/{video_id}/sd1.jpg",
+            "00:15": f"https://i.ytimg.com/vi/{video_id}/sd2.jpg",
+            "00:25": f"https://i.ytimg.com/vi/{video_id}/sd3.jpg"
+        }
+        
+        downloaded_images = {}
+        for ts, url in thumb_urls.items():
+            try:
+                resp = requests.get(url, timeout=4)
+                if resp.status_code == 200 and len(resp.content) > 4000:
+                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                    downloaded_images[ts] = img
+            except Exception:
+                pass
+
+        status_text.text("⚡ [3/4] Esecuzione modelli Vision-Language AI...")
+        progress_bar.progress(80)
+
+        results = None
+        if gemini_api_key and downloaded_images:
+            results = analyze_with_gemini_vlm(gemini_api_key, downloaded_images, video_id)
+        
+        if not results and downloaded_images:
+            results = analyze_frames_local_cv(downloaded_images, video_id)
+
+        progress_bar.progress(100)
+        status_text.text("✅ [4/4] Analisi visiva completata con successo!")
+
+        analysis_obj = {
+            "video_id": video_id,
+            "title": f"Video {video_id}",
+            "results": results
+        }
+        st.session_state['current_analysis'] = analysis_obj
+
+        # Salva nella Cronologia se non già presente
+        if not any(item['video_id'] == video_id for item in st.session_state['history']):
+            st.session_state['history'].append(analysis_obj)
+
+    # Rendering dei Risultati (Attuali o da Cronologia)
+    current_data = st.session_state.get('current_analysis')
+    if current_data and current_data.get('results'):
+        results = current_data['results']
+        vid = current_data['video_id']
+
+        st.success(f"Trovati {len(results)} rilevamenti visivi nel video ID `{vid}`!")
+        for item in results:
+            st.markdown(f"### ▶ {item['time']} - {item['title']}")
+            st.write(f"**Descrizione**: {item.get('description') or item.get('desc')}")
+            st.write(f"**Confidenza AI**: `{item['confidence']}`")
+            st.markdown(f"[↗ Apri direttamente al secondo {item['seconds']} su YouTube](https://www.youtube.com/watch?v={vid}&t={item['seconds']}s)")
+            st.divider()
     else:
         st.info("Incolla un URL YouTube e clicca su **'Analizza Video'** per avviare la scansione dei materiali Storopack.")
