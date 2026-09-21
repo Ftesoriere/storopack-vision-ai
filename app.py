@@ -4,6 +4,7 @@ import requests
 from PIL import Image
 import numpy as np
 import io
+import json
 
 # Configurazione Pagina Streamlit
 st.set_page_config(
@@ -56,12 +57,21 @@ def extract_timestamp_param(url):
 
 def analyze_with_gemini_vlm(api_key, images_dict, video_id):
     """
-    Invia le immagini reali estratte dal video a Google Gemini 2.5 Flash per l'analisi visiva reale.
+    Invia le immagini reali estratte dal video a Google Gemini VLM tentando automaticamente i modelli disponibili.
     """
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-2.5-flash')
+
+        # Elenco dei nomi modello supportati dall'API Google Gemini in ordine di preferenza
+        model_candidates = [
+            'gemini-1.5-flash',
+            'gemini-1.5-pro',
+            'gemini-2.0-flash',
+            'gemini-2.5-flash',
+            'gemini-3.6-flash',
+            'gemini-pro-vision'
+        ]
 
         prompt = """
         Sei un esperto di imballaggi protettivi industriali Storopack. Analizza attentamente queste immagini estratte dai frame del video.
@@ -90,13 +100,26 @@ def analyze_with_gemini_vlm(api_key, images_dict, video_id):
             input_payload.append(f"Frame al timestamp {ts}:")
             input_payload.append(img)
 
-        response = model.generate_content(input_payload)
-        text = response.text
-        json_match = re.search(r'\[.*\]', text, re.DOTALL)
-        if json_match:
-            return eval(json_match.group(0))
+        # Prova i candidati modello fino a trovare quello attivo per l'API key
+        last_err = None
+        for model_name in model_candidates:
+            try:
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(input_payload)
+                text = response.text
+                json_match = re.search(r'\[.*\]', text, re.DOTALL)
+                if json_match:
+                    st.info(f"✨ Analisi visiva completata con successo con il modello **{model_name}**!")
+                    return json.loads(json_match.group(0))
+            except Exception as err:
+                last_err = err
+                continue
+
+        if last_err:
+            st.warning(f"Chiamata Gemini VLM ({last_err}). Passaggio alla Computer Vision locale.")
+
     except Exception as e:
-        st.warning(f"Chiamata Gemini VLM: {e}. Passaggio al motore locale di Computer Vision.")
+        st.warning(f"Errore configurazione Gemini: {e}. Passaggio alla Computer Vision locale.")
     
     return None
 
