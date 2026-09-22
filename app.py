@@ -12,12 +12,16 @@ st.set_page_config(
 # ---------------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------------
-if 'history' not in st.session_state:
-    st.session_state['history'] = []
-if 'current_analysis' not in st.session_state:
-    st.session_state['current_analysis'] = None
-if 'saved_api_key' not in st.session_state:
-    st.session_state['saved_api_key'] = ""
+for key, default in [
+    ('history', []),
+    ('current_analysis', None),
+    ('saved_api_key', ""),
+    ('key_validated', False),
+    ('key_validation_msg', ""),
+    ('available_models', []),
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
 # ---------------------------------------------------------------------------
 # HEADER
@@ -26,7 +30,7 @@ st.markdown("""
     <div style="background: linear-gradient(135deg, #003366, #0056b3); padding: 22px 28px; border-radius: 12px; color: white; margin-bottom: 25px;">
         <h1 style="margin:0; font-size: 26px; font-weight: 700;">📦 Storopack Vision AI Analyzer</h1>
         <p style="margin:5px 0 0 0; opacity:0.9; font-size: 14px;">
-            Analisi nativa del flusso video YouTube tramite Google Gemini &mdash; rilevamento di PAPERplus&reg;, AIRplus&reg;, FOAMplus&reg;, PELASPAN&reg;
+            Analisi nativa del flusso video YouTube tramite Google Gemini &mdash; PAPERplus&reg;, AIRplus&reg;, FOAMplus&reg;, PELASPAN&reg;
         </p>
     </div>
 """, unsafe_allow_html=True)
@@ -34,7 +38,7 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 # SIDEBAR - API KEY
 # ---------------------------------------------------------------------------
-st.sidebar.header("🔑 Google AI Studio API Key")
+st.sidebar.header("🔑 Gemini API Key")
 
 default_key = st.session_state.get('saved_api_key', '')
 try:
@@ -44,45 +48,97 @@ except Exception:
     pass
 
 input_key = st.sidebar.text_input(
-    "API Key (formato AIza...):",
+    "API Key (formato AQ. oppure AIza):",
     value=default_key,
     type="password",
-    help="Genera la chiave su https://aistudio.google.com/apikey. Deve iniziare con 'AIza'."
+    help="Le chiavi create oggi su AI Studio iniziano con 'AQ.'. Le vecchie 'AIza' sono state dismesse da Google a settembre 2026."
 )
 
-if input_key:
+if input_key and input_key.strip() != st.session_state['saved_api_key']:
     st.session_state['saved_api_key'] = input_key.strip()
+    st.session_state['key_validated'] = False
+    st.session_state['available_models'] = []
 
 active_api_key = st.session_state.get('saved_api_key', '')
 
-# Validazione formato chiave
-key_format_ok = active_api_key.startswith("AIza") and len(active_api_key) > 30
-
-if not active_api_key:
-    st.sidebar.warning("🔴 Nessuna API Key inserita.")
-elif not key_format_ok:
-    st.sidebar.error(
-        "🔴 Formato chiave non valido.\n\n"
-        "Stai usando una credenziale OAuth / Service Account. "
-        "Serve una API Key di **Google AI Studio** che inizia con `AIza`."
-    )
-    st.sidebar.markdown("👉 [Genera la chiave corretta](https://aistudio.google.com/apikey)")
+# Riconoscimento del tipo di chiave (informativo, NON bloccante)
+if active_api_key.startswith("AQ."):
+    key_type = "Auth key (formato attuale Google 2026)"
+elif active_api_key.startswith("AIza"):
+    key_type = "Standard key (formato legacy, dismesso da Google)"
+elif active_api_key:
+    key_type = "Formato non riconosciuto"
 else:
-    st.sidebar.success("🟢 API Key AI Studio valida e salvata in sessione")
+    key_type = None
+
+
+def validate_key_live(api_key):
+    """Verifica reale della chiave interrogando l'endpoint Gemini."""
+    try:
+        from google import genai
+    except ImportError as e:
+        return False, f"SDK google-genai non installato: {e}", []
+
+    try:
+        client = genai.Client(api_key=api_key)
+        models = []
+        for m in client.models.list():
+            name = getattr(m, "name", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if not actions or "generateContent" in actions:
+                models.append(name)
+        if models:
+            return True, f"Connessione riuscita — {len(models)} modelli disponibili", models
+        return False, "Connessione riuscita ma nessun modello generativo disponibile", []
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", []
+
+
+if active_api_key:
+    st.sidebar.caption(f"Tipo rilevato: {key_type}")
+    if st.sidebar.button("🔍 Verifica connessione", use_container_width=True):
+        with st.spinner("Verifica in corso…"):
+            ok, msg, models = validate_key_live(active_api_key)
+        st.session_state['key_validated'] = ok
+        st.session_state['key_validation_msg'] = msg
+        st.session_state['available_models'] = models
+
+    if st.session_state['key_validated']:
+        st.sidebar.success(f"🟢 {st.session_state['key_validation_msg']}")
+    elif st.session_state['key_validation_msg']:
+        st.sidebar.error(f"🔴 {st.session_state['key_validation_msg']}")
+    else:
+        st.sidebar.info("Chiave salvata. Clicca su *Verifica connessione* per testarla.")
+else:
+    st.sidebar.warning("🔴 Nessuna API Key inserita.")
+    st.sidebar.markdown("👉 [Genera la chiave su AI Studio](https://aistudio.google.com/apikey)")
 
 st.sidebar.divider()
 
+# ---------------------------------------------------------------------------
+# SIDEBAR - PARAMETRI
+# ---------------------------------------------------------------------------
 st.sidebar.header("⚙️ Parametri di Analisi")
+
+detected = st.session_state.get('available_models', [])
+model_options = [m.replace("models/", "") for m in detected] if detected else [
+    "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"
+]
+preferred = next(
+    (m for m in model_options if "flash" in m and ("2.5" in m or "3." in m)),
+    model_options[0]
+)
 model_choice = st.sidebar.selectbox(
     "Modello Gemini:",
-    ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"],
-    index=0
+    model_options,
+    index=model_options.index(preferred) if preferred in model_options else 0,
 )
+
 fps_choice = st.sidebar.select_slider(
-    "Campionamento temporale (fps):",
+    "Campionamento (fps):",
     options=[0.2, 0.5, 1.0, 2.0],
     value=1.0,
-    help="1.0 = un frame al secondo. Valori più alti aumentano precisione e costo."
+    help="1.0 = un frame al secondo dell'intero video."
 )
 
 st.sidebar.header("🎯 Materiali da cercare")
@@ -109,7 +165,7 @@ def extract_youtube_id(url):
     if not url:
         return None
     clean = url.strip()
-    m = re.search(r'(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=))([\w-]{11})', clean)
+    m = re.search(r'(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=|shorts/))([\w-]{11})', clean)
     if m:
         return m.group(1)
     if len(clean) == 11 and '/' not in clean:
@@ -118,7 +174,7 @@ def extract_youtube_id(url):
 
 
 def build_prompt(active_targets, fps):
-    wanted = [k for k, v in active_targets.items() if v]
+    wanted = [k for k, v in active_targets.items() if v] or ["qualsiasi materiale da imballaggio"]
     return f"""Sei un ispettore tecnico specializzato in imballaggi protettivi industriali Storopack.
 
 Guarda l'INTERO video e individua OGNI momento in cui compare o viene manipolato
@@ -131,21 +187,21 @@ Riferimenti visivi:
   d'aria (pluriball), sacchetti gonfiati.
 - FOAMplus: schiuma poliuretanica espansa, sacchetti di schiuma auto-modellanti,
   inserti in polistirolo bianco sagomato.
-- PELASPAN: chip/trucioli sfusi a forma di S, bianchi o verdi.
+- PELASPAN: chip o trucioli sfusi a forma di S, bianchi o verdi.
 - CARTONE: scatole in cartone ondulato, nastro adesivo da imballaggio, etichette.
 
 REGOLE OBBLIGATORIE:
-1. Fornisci il timestamp REALE osservato nel video, nel formato MM:SS.
-2. Dai priorità alle AZIONI (operatore o macchina che inserisce/avvolge il materiale)
-   rispetto alla semplice presenza passiva sullo sfondo.
-3. Non inventare timestamp: se un materiale non compare, non elencarlo.
-4. Se lo stesso materiale resta visibile a lungo, indica una sola riga con il momento
-   più rappresentativo.
-5. La confidenza deve riflettere quanto sei realmente sicuro (0-100).
+1. Fornisci il timestamp REALE osservato nel video, formato MM:SS.
+2. Dai priorità alle AZIONI (operatore o macchina che inserisce, avvolge o eroga
+   il materiale) rispetto alla semplice presenza passiva sullo sfondo.
+3. Non inventare timestamp. Se un materiale non compare, non elencarlo.
+4. Se lo stesso materiale resta visibile a lungo, indica una sola riga con il
+   momento più rappresentativo.
+5. La confidenza deve riflettere quanto sei realmente sicuro.
 
 Campionamento richiesto: circa {fps} frame al secondo.
 
-Rispondi ESCLUSIVAMENTE con un array JSON valido, senza testo prima o dopo:
+Rispondi ESCLUSIVAMENTE con un array JSON valido, nessun testo prima o dopo:
 [
   {{
     "time": "00:12",
@@ -163,14 +219,14 @@ Se non rilevi alcun materiale da imballaggio, rispondi con: []
 
 def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps):
     """
-    Invia l'URL YouTube direttamente a Gemini: il video viene elaborato
-    lato Google, senza download locale.
-    Ritorna: (results, diagnostics)
+    Passa l'URL YouTube direttamente a Gemini: il video viene elaborato
+    sui server Google, senza download locale.
     """
-    diagnostics = {
-        "sdk": None,
-        "model_requested": model_name,
-        "method": "native_youtube_uri",
+    diag = {
+        "sdk": "google-genai",
+        "model": model_name,
+        "method": None,
+        "attempts": [],
         "raw_response_excerpt": None,
         "error": None,
     }
@@ -178,66 +234,56 @@ def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps):
     try:
         from google import genai
         from google.genai import types
-        diagnostics["sdk"] = "google-genai"
     except ImportError as e:
-        diagnostics["error"] = f"SDK google-genai non disponibile: {e}"
-        return None, diagnostics
+        diag["error"] = f"SDK google-genai non disponibile: {e}"
+        return None, diag
 
     try:
         client = genai.Client(api_key=api_key)
+    except Exception as e:
+        diag["error"] = f"Client non inizializzabile: {type(e).__name__}: {e}"
+        return None, diag
 
-        video_part = types.Part(
+    # Tentativo 1: con controllo fps
+    # Tentativo 2: senza video_metadata (alcuni modelli non la accettano)
+    strategies = [
+        ("con_fps", lambda: types.Part(
             file_data=types.FileData(file_uri=youtube_url),
             video_metadata=types.VideoMetadata(fps=fps),
-        )
+        )),
+        ("senza_fps", lambda: types.Part(
+            file_data=types.FileData(file_uri=youtube_url)
+        )),
+    ]
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=types.Content(parts=[video_part, types.Part(text=prompt)]),
-        )
-
-        text = (response.text or "").strip()
-        diagnostics["raw_response_excerpt"] = text[:600]
-
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if not match:
-            diagnostics["error"] = "Nessun array JSON trovato nella risposta del modello."
-            return None, diagnostics
-
-        parsed = json.loads(match.group(0))
-        for item in parsed:
-            item["engine_used"] = f"Gemini nativo su URL YouTube ({model_name})"
-        return parsed, diagnostics
-
-    except Exception as e:
-        diagnostics["error"] = f"{type(e).__name__}: {e}"
-
-        # Secondo tentativo senza video_metadata (alcuni modelli non la accettano)
+    for label, part_builder in strategies:
         try:
-            from google import genai
-            from google.genai import types
-            client = genai.Client(api_key=api_key)
+            video_part = part_builder()
             response = client.models.generate_content(
                 model=model_name,
-                contents=types.Content(parts=[
-                    types.Part(file_data=types.FileData(file_uri=youtube_url)),
-                    types.Part(text=prompt),
-                ]),
+                contents=types.Content(parts=[video_part, types.Part(text=prompt)]),
             )
             text = (response.text or "").strip()
-            diagnostics["raw_response_excerpt"] = text[:600]
-            diagnostics["method"] = "native_youtube_uri_fallback_no_fps"
+            diag["attempts"].append({"strategy": label, "outcome": "risposta ricevuta"})
+            diag["raw_response_excerpt"] = text[:800]
+
             match = re.search(r'\[.*\]', text, re.DOTALL)
             if match:
                 parsed = json.loads(match.group(0))
                 for item in parsed:
-                    item["engine_used"] = f"Gemini nativo su URL YouTube ({model_name}, fallback)"
-                diagnostics["error"] = None
-                return parsed, diagnostics
-        except Exception as e2:
-            diagnostics["error"] = f"{diagnostics['error']} | Fallback: {type(e2).__name__}: {e2}"
+                    item["engine_used"] = f"Gemini nativo su URL YouTube ({model_name}, {label})"
+                diag["method"] = label
+                return parsed, diag
 
-        return None, diagnostics
+            diag["attempts"][-1]["outcome"] = "nessun JSON nella risposta"
+        except Exception as e:
+            diag["attempts"].append({
+                "strategy": label,
+                "outcome": f"{type(e).__name__}: {e}"
+            })
+
+    diag["error"] = "Tutte le strategie hanno fallito. Vedi 'attempts' per il dettaglio."
+    return None, diag
 
 
 # ---------------------------------------------------------------------------
@@ -249,31 +295,38 @@ with col_left:
     st.subheader("1. Video da analizzare")
     video_url = st.text_input(
         "URL YouTube:",
-        value="https://www.youtube.com/watch?v=Uo3pD0sRbII"
+        value="https://www.youtube.com/watch?v=Uo3pD0sRbII",
+        placeholder="https://www.youtube.com/watch?v=..."
     )
-    btn = st.button("🚀 Analizza video con Gemini", type="primary", disabled=not key_format_ok)
-
-    if not key_format_ok:
-        st.caption("⚠️ Inserisci una API Key valida di Google AI Studio per abilitare l'analisi.")
+    btn = st.button(
+        "🚀 Analizza video con Gemini",
+        type="primary",
+        disabled=not bool(active_api_key),
+        use_container_width=True,
+    )
+    if not active_api_key:
+        st.caption("⚠️ Inserisci una API Key nella barra laterale per abilitare l'analisi.")
 
     video_id = extract_youtube_id(video_url)
     if video_id:
         st.video(f"https://www.youtube.com/watch?v={video_id}")
+    elif video_url:
+        st.warning("URL YouTube non riconosciuto.")
 
 with col_right:
     st.subheader("2. Materiali rilevati")
 
-    if btn and video_id and key_format_ok:
+    if btn and video_id and active_api_key:
         clean_url = f"https://www.youtube.com/watch?v={video_id}"
         prompt = build_prompt(targets, fps_choice)
 
-        with st.spinner(f"Gemini sta guardando l'intero video a {fps_choice} fps… (30-90 s per video lunghi)"):
+        with st.spinner(f"Gemini sta guardando l'intero video a {fps_choice} fps… (30-90 s)"):
             results, diag = analyze_youtube_native(
                 active_api_key, clean_url, model_choice, prompt, fps_choice
             )
 
         if results is None:
-            st.error("❌ Analisi non riuscita. Dettagli tecnici qui sotto.")
+            st.error("❌ Analisi non riuscita. Nessun risultato inventato — ecco il motivo tecnico reale:")
             with st.expander("🔧 Diagnostica tecnica", expanded=True):
                 st.json(diag)
         elif len(results) == 0:
@@ -295,9 +348,6 @@ with col_right:
                 h for h in st.session_state['history'] if h['video_id'] != video_id
             ] + [analysis_obj]
 
-    # -----------------------------------------------------------------------
-    # RENDER RISULTATI
-    # -----------------------------------------------------------------------
     current = st.session_state.get('current_analysis')
     if current and current.get('results'):
         results = current['results']
@@ -327,6 +377,7 @@ with col_right:
             data=json.dumps(audit, indent=2, ensure_ascii=False),
             file_name=f"storopack_audit_{vid}.json",
             mime="application/json",
+            use_container_width=True,
         )
 
         st.divider()
