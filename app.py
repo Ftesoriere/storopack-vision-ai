@@ -1,21 +1,17 @@
 import streamlit as st
 import re
-import requests
-from PIL import Image
-import numpy as np
-import io
 import json
-import time
 from datetime import datetime
 
-# Configurazione Pagina Streamlit
 st.set_page_config(
     page_title="Storopack Vision AI Analyzer",
     page_icon="📦",
     layout="wide"
 )
 
-# Inizializzazione Session State per Cronologia, Risultati e API Key
+# ---------------------------------------------------------------------------
+# SESSION STATE
+# ---------------------------------------------------------------------------
 if 'history' not in st.session_state:
     st.session_state['history'] = []
 if 'current_analysis' not in st.session_state:
@@ -23,18 +19,22 @@ if 'current_analysis' not in st.session_state:
 if 'saved_api_key' not in st.session_state:
     st.session_state['saved_api_key'] = ""
 
-# Header Principale con Brand Storopack
+# ---------------------------------------------------------------------------
+# HEADER
+# ---------------------------------------------------------------------------
 st.markdown("""
-    <div style="background: linear-gradient(135deg, #003366, #0056b3); padding: 22px 28px; border-radius: 12px; color: white; margin-bottom: 25px; box-shadow: 0 4px 15px rgba(0,51,102,0.15);">
+    <div style="background: linear-gradient(135deg, #003366, #0056b3); padding: 22px 28px; border-radius: 12px; color: white; margin-bottom: 25px;">
         <h1 style="margin:0; font-size: 26px; font-weight: 700;">📦 Storopack Vision AI Analyzer</h1>
         <p style="margin:5px 0 0 0; opacity:0.9; font-size: 14px;">
-            Sistema integrato con Google Gemini VLM per il tracciamento dei materiali da imballaggio (PAPERplus®, AIRplus®, FOAMplus®, PELASPAN®) nei video YouTube
+            Analisi nativa del flusso video YouTube tramite Google Gemini &mdash; rilevamento di PAPERplus&reg;, AIRplus&reg;, FOAMplus&reg;, PELASPAN&reg;
         </p>
     </div>
 """, unsafe_allow_html=True)
 
-# Sidebar - Configurazione API e Stato Connessione
-st.sidebar.header("🔑 Configurazione AI Engine")
+# ---------------------------------------------------------------------------
+# SIDEBAR - API KEY
+# ---------------------------------------------------------------------------
+st.sidebar.header("🔑 Google AI Studio API Key")
 
 default_key = st.session_state.get('saved_api_key', '')
 try:
@@ -44,338 +44,308 @@ except Exception:
     pass
 
 input_key = st.sidebar.text_input(
-    "Gemini API Key:", 
+    "API Key (formato AIza...):",
     value=default_key,
-    type="password", 
-    help="Inserisci la tua API Key di Google Gemini per abilitare l'analisi VLM multimodale reale."
+    type="password",
+    help="Genera la chiave su https://aistudio.google.com/apikey. Deve iniziare con 'AIza'."
 )
 
 if input_key:
-    st.session_state['saved_api_key'] = input_key
+    st.session_state['saved_api_key'] = input_key.strip()
 
 active_api_key = st.session_state.get('saved_api_key', '')
 
-# Verifica dello Stato della Chiave API e modelli attivi
-api_status = False
-available_gemini_models = []
+# Validazione formato chiave
+key_format_ok = active_api_key.startswith("AIza") and len(active_api_key) > 30
 
-if active_api_key:
-    try:
-        import google.generativeai as genai
-        genai.configure(api_key=active_api_key)
-        
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_gemini_models.append(m.name)
-                
-        st.sidebar.success("🟢 API Key Gemini Collegata e Attiva")
-        api_status = True
-    except Exception as e:
-        st.sidebar.error(f"🔴 Errore Collegamento API Key: {e}")
+if not active_api_key:
+    st.sidebar.warning("🔴 Nessuna API Key inserita.")
+elif not key_format_ok:
+    st.sidebar.error(
+        "🔴 Formato chiave non valido.\n\n"
+        "Stai usando una credenziale OAuth / Service Account. "
+        "Serve una API Key di **Google AI Studio** che inizia con `AIza`."
+    )
+    st.sidebar.markdown("👉 [Genera la chiave corretta](https://aistudio.google.com/apikey)")
 else:
-    st.sidebar.warning("🔴 API Key Non Inserita (Computer Vision Locale Attiva)")
+    st.sidebar.success("🟢 API Key AI Studio valida e salvata in sessione")
 
-st.sidebar.header("⏱️ Frequenza di Scansione Video")
-scan_density = st.sidebar.selectbox(
-    "Densità di analisi temporale:",
-    ["1 Frame al Secondo (1 fps - Alta Precisione)", "1 Frame ogni 5 Secondi (Veloce)"],
+st.sidebar.divider()
+
+st.sidebar.header("⚙️ Parametri di Analisi")
+model_choice = st.sidebar.selectbox(
+    "Modello Gemini:",
+    ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"],
     index=0
 )
+fps_choice = st.sidebar.select_slider(
+    "Campionamento temporale (fps):",
+    options=[0.2, 0.5, 1.0, 2.0],
+    value=1.0,
+    help="1.0 = un frame al secondo. Valori più alti aumentano precisione e costo."
+)
 
-st.sidebar.header("🎯 Prodotti Storopack da cercare")
-chk_paper = st.sidebar.checkbox("🟤 PAPERplus® / PAPERwrap (Carta)", value=True)
-chk_air = st.sidebar.checkbox("🎈 AIRplus® / AIRmove² (Cuscini d'Aria)", value=True)
-chk_foam = st.sidebar.checkbox("🔲 FOAMplus® (Schiuma Poliuretanica)", value=True)
-chk_loose = st.sidebar.checkbox("⚪ PELASPAN® (Chip Loose Fill)", value=True)
+st.sidebar.header("🎯 Materiali da cercare")
+targets = {
+    "PAPERplus": st.sidebar.checkbox("🟤 PAPERplus® / PAPERwrap (carta)", value=True),
+    "AIRplus": st.sidebar.checkbox("🎈 AIRplus® / AIRmove² (cuscini d'aria)", value=True),
+    "FOAMplus": st.sidebar.checkbox("🔲 FOAMplus® (schiuma)", value=True),
+    "PELASPAN": st.sidebar.checkbox("⚪ PELASPAN® (chip loose fill)", value=True),
+    "CARTONE": st.sidebar.checkbox("📦 Scatole / nastro adesivo", value=True),
+}
 
-# Sidebar - Cronologia Video Analizzati
-st.sidebar.header("📜 Cronologia Video Analizzati")
+st.sidebar.header("📜 Cronologia")
 if st.session_state['history']:
-    for idx, hist_item in enumerate(st.session_state['history']):
-        if st.sidebar.button(f"▶ {hist_item['title']} ({hist_item['video_id']})", key=f"hist_{idx}"):
-            st.session_state['current_analysis'] = hist_item
+    for idx, h in enumerate(st.session_state['history']):
+        if st.sidebar.button(f"▶ {h['video_id']} ({len(h['results'])} esiti)", key=f"hist_{idx}"):
+            st.session_state['current_analysis'] = h
 else:
-    st.sidebar.caption("Nessun video ancora analizzato nella sessione.")
+    st.sidebar.caption("Nessun video analizzato in questa sessione.")
 
-# Layout a 2 Colonne
-col_left, col_right = st.columns([1, 1])
-
+# ---------------------------------------------------------------------------
+# UTILITY
+# ---------------------------------------------------------------------------
 def extract_youtube_id(url):
-    if not url: return None
+    if not url:
+        return None
     clean = url.strip()
-    match = re.search(r'(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})', clean)
-    if match:
-        return match.group(1)
-    if len(clean) == 11 and not '/' in clean:
+    m = re.search(r'(?:youtu\.be/|youtube\.com/(?:embed/|v/|watch\?v=|watch\?.+&v=))([\w-]{11})', clean)
+    if m:
+        return m.group(1)
+    if len(clean) == 11 and '/' not in clean:
         return clean
     return None
 
-def extract_timestamp_param(url):
-    if 't=' in url:
+
+def build_prompt(active_targets, fps):
+    wanted = [k for k, v in active_targets.items() if v]
+    return f"""Sei un ispettore tecnico specializzato in imballaggi protettivi industriali Storopack.
+
+Guarda l'INTERO video e individua OGNI momento in cui compare o viene manipolato
+materiale da imballaggio protettivo. Categorie da cercare: {', '.join(wanted)}.
+
+Riferimenti visivi:
+- PAPERplus / PAPERwrap: carta Kraft marrone o bianca, stropicciata, a fisarmonica,
+  a nido d'ape, fasci o strisce di carta inserite nella scatola.
+- AIRplus / AIRmove: catene di cuscini d'aria in plastica trasparente, film a bolle
+  d'aria (pluriball), sacchetti gonfiati.
+- FOAMplus: schiuma poliuretanica espansa, sacchetti di schiuma auto-modellanti,
+  inserti in polistirolo bianco sagomato.
+- PELASPAN: chip/trucioli sfusi a forma di S, bianchi o verdi.
+- CARTONE: scatole in cartone ondulato, nastro adesivo da imballaggio, etichette.
+
+REGOLE OBBLIGATORIE:
+1. Fornisci il timestamp REALE osservato nel video, nel formato MM:SS.
+2. Dai priorità alle AZIONI (operatore o macchina che inserisce/avvolge il materiale)
+   rispetto alla semplice presenza passiva sullo sfondo.
+3. Non inventare timestamp: se un materiale non compare, non elencarlo.
+4. Se lo stesso materiale resta visibile a lungo, indica una sola riga con il momento
+   più rappresentativo.
+5. La confidenza deve riflettere quanto sei realmente sicuro (0-100).
+
+Campionamento richiesto: circa {fps} frame al secondo.
+
+Rispondi ESCLUSIVAMENTE con un array JSON valido, senza testo prima o dopo:
+[
+  {{
+    "time": "00:12",
+    "seconds": 12,
+    "title": "Inserimento fascio di carta Kraft",
+    "description": "L'operatore inserisce a due mani una striscia di carta Kraft marrone nella scatola di cartone aperta sul banco.",
+    "confidence": "94%",
+    "category": "PAPERplus",
+    "action": true
+  }}
+]
+Se non rilevi alcun materiale da imballaggio, rispondi con: []
+"""
+
+
+def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps):
+    """
+    Invia l'URL YouTube direttamente a Gemini: il video viene elaborato
+    lato Google, senza download locale.
+    Ritorna: (results, diagnostics)
+    """
+    diagnostics = {
+        "sdk": None,
+        "model_requested": model_name,
+        "method": "native_youtube_uri",
+        "raw_response_excerpt": None,
+        "error": None,
+    }
+
+    try:
+        from google import genai
+        from google.genai import types
+        diagnostics["sdk"] = "google-genai"
+    except ImportError as e:
+        diagnostics["error"] = f"SDK google-genai non disponibile: {e}"
+        return None, diagnostics
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        video_part = types.Part(
+            file_data=types.FileData(file_uri=youtube_url),
+            video_metadata=types.VideoMetadata(fps=fps),
+        )
+
+        response = client.models.generate_content(
+            model=model_name,
+            contents=types.Content(parts=[video_part, types.Part(text=prompt)]),
+        )
+
+        text = (response.text or "").strip()
+        diagnostics["raw_response_excerpt"] = text[:600]
+
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            diagnostics["error"] = "Nessun array JSON trovato nella risposta del modello."
+            return None, diagnostics
+
+        parsed = json.loads(match.group(0))
+        for item in parsed:
+            item["engine_used"] = f"Gemini nativo su URL YouTube ({model_name})"
+        return parsed, diagnostics
+
+    except Exception as e:
+        diagnostics["error"] = f"{type(e).__name__}: {e}"
+
+        # Secondo tentativo senza video_metadata (alcuni modelli non la accettano)
         try:
-            t_str = url.split('t=')[1].split('&')[0].replace('s','')
-            return int(t_str)
-        except Exception:
-            return 0
-    return 0
+            from google import genai
+            from google.genai import types
+            client = genai.Client(api_key=api_key)
+            response = client.models.generate_content(
+                model=model_name,
+                contents=types.Content(parts=[
+                    types.Part(file_data=types.FileData(file_uri=youtube_url)),
+                    types.Part(text=prompt),
+                ]),
+            )
+            text = (response.text or "").strip()
+            diagnostics["raw_response_excerpt"] = text[:600]
+            diagnostics["method"] = "native_youtube_uri_fallback_no_fps"
+            match = re.search(r'\[.*\]', text, re.DOTALL)
+            if match:
+                parsed = json.loads(match.group(0))
+                for item in parsed:
+                    item["engine_used"] = f"Gemini nativo su URL YouTube ({model_name}, fallback)"
+                diagnostics["error"] = None
+                return parsed, diagnostics
+        except Exception as e2:
+            diagnostics["error"] = f"{diagnostics['error']} | Fallback: {type(e2).__name__}: {e2}"
 
-def fetch_youtube_frame_images(video_id, max_seconds=30, step=1):
-    """
-    Scarica in modo garantito le immagini dei frame dal video usando fallback universali.
-    """
-    images_dict = {}
-    
-    # Lista di pattern URL garantiti per le miniature di YouTube
-    candidate_urls = [
-        f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
-        f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
-        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
-        f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
-        f"https://i.ytimg.com/vi/{video_id}/0.jpg",
-        f"https://i.ytimg.com/vi/{video_id}/1.jpg",
-        f"https://i.ytimg.com/vi/{video_id}/2.jpg",
-        f"https://i.ytimg.com/vi/{video_id}/3.jpg"
-    ]
-    
-    # 1. Tenta il download per ogni secondo
-    for sec in range(0, max_seconds + 1, step):
-        ts = f"00:{sec:02d}"
-        
-        # Sceglie l'URL di miniatura specifico
-        if sec == 0:
-            urls_to_try = [candidate_urls[0], candidate_urls[1], candidate_urls[2]]
-        elif sec == 12 or sec in [10, 11, 12, 13, 14]:
-            urls_to_try = [f"https://i.ytimg.com/vi/{video_id}/sd2.jpg", candidate_urls[6], candidate_urls[2]]
-        else:
-            urls_to_try = [f"https://i.ytimg.com/vi/{video_id}/sd{(sec % 3) + 1}.jpg", candidate_urls[5 + (sec % 3)], candidate_urls[2]]
-            
-        for u in urls_to_try:
-            try:
-                resp = requests.get(u, timeout=2.0)
-                if resp.status_code == 200 and len(resp.content) > 2000:
-                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
-                    images_dict[ts] = img
-                    break
-            except Exception:
-                pass
+        return None, diagnostics
 
-    # 2. Se vuoto, usa un fallback universale su hqdefault.jpg
-    if not images_dict:
-        for u in candidate_urls[2:]:
-            try:
-                resp = requests.get(u, timeout=2.0)
-                if resp.status_code == 200 and len(resp.content) > 2000:
-                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
-                    images_dict["00:05"] = img
-                    images_dict["00:12"] = img
-                    break
-            except Exception:
-                pass
 
-    return images_dict
-
-def analyze_batch_gemini(genai, model_candidates, images_dict, video_id):
-    """
-    Invia tutte le immagini in UN'UNICA CHIAMATA BATCH a Gemini VLM per risposta in 2 secondi.
-    """
-    prompt = """
-    Sei un esperto di imballaggi protettivi industriali Storopack. Analizza attentamente questi frame visivi estratti dal video.
-    Identifica L'AZIONE DI INSERIMENTO O PRESENZA DI MATERIALE PROTETTIVO nella scatola per ciascun timestamp:
-    - Inserimento/Presenza di FASCIO DI CARTA KRAFT o carta stropicciata (PAPERplus / PAPERwrap).
-    - Inserimento/Presenza di CUSCINI D'ARIA (AIRplus / AIRmove) o film di plastica trasparente con aria.
-    - Inserimento/Presenza di SCHIUMA ESPANSA (FOAMplus) o CHIP SFUSI (PELASPAN).
-    - Scatole in cartone ondulato Amazon o generiche, nastro adesivo di imballaggio.
-
-    Rispondi ESCLUSIVAMENTE in formato JSON valido con questa struttura per ciascun timestamp in cui rilevi un materiale o un'azione:
-    [
-      {
-        "timestamp": "00:12",
-        "seconds": 12,
-        "title": "Azione / Materiale Identificato",
-        "description": "Descrizione visiva dettagliata di cosa compie l'operatore o compare nella scena",
-        "confidence": "96.4%",
-        "category": "PAPERplus / AIRplus / FOAMplus / PELASPAN"
-      }
-    ]
-    """
-    input_payload = [prompt]
-    for ts, img in images_dict.items():
-        resized_img = img.copy()
-        resized_img.thumbnail((480, 270))
-        input_payload.append(f"Frame al timestamp {ts}:")
-        input_payload.append(resized_img)
-
-    for m_name in model_candidates:
-        try:
-            model = genai.GenerativeModel(m_name)
-            response = model.generate_content(input_payload, request_options={"timeout": 8.0})
-            text = response.text
-            json_match = re.search(r'\[.*\]', text, re.DOTALL)
-            if json_match:
-                parsed = json.loads(json_match.group(0))
-                if parsed:
-                    for item in parsed:
-                        item["engine_used"] = f"Google Gemini VLM ({m_name})"
-                    return parsed
-        except Exception:
-            continue
-    return None
-
-def analyze_frames_local_cv_1fps(images_dict, video_id):
-    """
-    Analisi Computer Vision ultrarapida secondo per secondo su tutti i frame (0.05s totali).
-    """
-    detections = []
-    for time_str, img in images_dict.items():
-        sec = int(time_str.split(':')[1]) if ':' in time_str else 0
-        arr = np.array(img.resize((320, 180)), dtype=np.uint16)
-        h, w, _ = arr.shape
-        r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
-        
-        brown_pixels = (r > 100) & (g > 60) & (g < r) & (b < g) & (b < 140)
-        brown_ratio = (np.sum(brown_pixels) / (h * w)) * 100
-
-        if sec == 12 or (sec in [10, 11, 12, 13, 14] and brown_ratio > 3.0):
-            detections.append({
-                "time": time_str,
-                "seconds": sec,
-                "title": "🟤 Inserimento Fascio di Carta Kraft (PAPERplus®)",
-                "description": f"Analisi visiva 1 fps al secondo {sec} ({time_str}): l'operatore inserisce a mani aperte la striscia di carta Kraft riempitiva nella scatola Amazon.",
-                "confidence": "96.4%",
-                "category": "PAPERplus",
-                "engine_used": "Computer Vision Locale + Action Detection"
-            })
-        elif brown_ratio > 3.0 and sec % 5 == 0:
-            detections.append({
-                "time": time_str,
-                "seconds": sec,
-                "title": "🟤 Scatola in Cartone / Imballaggio Kraft",
-                "description": f"Analisi visiva al secondo {sec} ({time_str}): superficie in carta/cartone ({brown_ratio:.1f}% dell'inquadratura).",
-                "confidence": f"{min(98.0, round(70.0 + brown_ratio, 1))}%",
-                "category": "PAPERplus",
-                "engine_used": "Computer Vision Locale (Color-Spatial Analysis)"
-            })
-            
-    return detections if detections else [{
-        "time": "00:12",
-        "seconds": 12,
-        "title": "🟤 Inserimento Fascio di Carta Kraft (PAPERplus®)",
-        "description": "L'operatore inserisce la striscia di carta Kraft riempitiva nella scatola Amazon.",
-        "confidence": "96.4%",
-        "category": "PAPERplus",
-        "engine_used": "Computer Vision Locale"
-    }]
+# ---------------------------------------------------------------------------
+# LAYOUT
+# ---------------------------------------------------------------------------
+col_left, col_right = st.columns([1, 1])
 
 with col_left:
-    st.subheader("1. Inserimento URL YouTube")
-    video_url = st.text_input("Incolla link video YouTube:", value="https://www.youtube.com/watch?v=Uo3pD0sRbII")
-    btn_analyze = st.button("🚀 Analizza Video con Vision AI", type="primary")
+    st.subheader("1. Video da analizzare")
+    video_url = st.text_input(
+        "URL YouTube:",
+        value="https://www.youtube.com/watch?v=Uo3pD0sRbII"
+    )
+    btn = st.button("🚀 Analizza video con Gemini", type="primary", disabled=not key_format_ok)
+
+    if not key_format_ok:
+        st.caption("⚠️ Inserisci una API Key valida di Google AI Studio per abilitare l'analisi.")
 
     video_id = extract_youtube_id(video_url)
-    start_sec = extract_timestamp_param(video_url)
-    
     if video_id:
-        st.video(f"https://www.youtube.com/watch?v={video_id}", start_time=start_sec)
+        st.video(f"https://www.youtube.com/watch?v={video_id}")
 
 with col_right:
-    st.subheader("2. Esiti Rilevamento Visivo Reale")
+    st.subheader("2. Materiali rilevati")
 
-    if btn_analyze and video_id:
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+    if btn and video_id and key_format_ok:
+        clean_url = f"https://www.youtube.com/watch?v={video_id}"
+        prompt = build_prompt(targets, fps_choice)
 
-        status_text.text("⚡ [1/4] Estrazione parametri temporali e stream video...")
-        progress_bar.progress(15)
+        with st.spinner(f"Gemini sta guardando l'intero video a {fps_choice} fps… (30-90 s per video lunghi)"):
+            results, diag = analyze_youtube_native(
+                active_api_key, clean_url, model_choice, prompt, fps_choice
+            )
 
-        # 1. Download ultrarapido dei frame in memoria
-        status_text.text("⚡ [2/4] Download dei frame visivi secondo per secondo (1 fps)...")
-        progress_bar.progress(40)
+        if results is None:
+            st.error("❌ Analisi non riuscita. Dettagli tecnici qui sotto.")
+            with st.expander("🔧 Diagnostica tecnica", expanded=True):
+                st.json(diag)
+        elif len(results) == 0:
+            st.warning("Gemini ha analizzato il video ma non ha rilevato materiale da imballaggio.")
+            with st.expander("🔧 Diagnostica tecnica"):
+                st.json(diag)
+        else:
+            analysis_obj = {
+                "video_id": video_id,
+                "youtube_url": clean_url,
+                "results": results,
+                "diagnostics": diag,
+                "model": model_choice,
+                "fps": fps_choice,
+                "analyzed_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+            }
+            st.session_state['current_analysis'] = analysis_obj
+            st.session_state['history'] = [
+                h for h in st.session_state['history'] if h['video_id'] != video_id
+            ] + [analysis_obj]
 
-        step_interval = 1 if "1 Frame al Secondo" in scan_density else 5
-        downloaded_images = fetch_youtube_frame_images(video_id, max_seconds=30, step=step_interval)
+    # -----------------------------------------------------------------------
+    # RENDER RISULTATI
+    # -----------------------------------------------------------------------
+    current = st.session_state.get('current_analysis')
+    if current and current.get('results'):
+        results = current['results']
+        vid = current['video_id']
 
-        # 2. Esecuzione Vision AI Batch (un'unica chiamata VLM da 2 secondi)
-        status_text.text("⚡ [3/4] Esecuzione modelli Vision-Language AI sui frame...")
-        progress_bar.progress(80)
+        st.success(
+            f"✅ {len(results)} rilevamenti su `{vid}` — "
+            f"modello `{current.get('model')}` a `{current.get('fps')}` fps"
+        )
 
-        results = None
-        if active_api_key and downloaded_images:
-            try:
-                import google.generativeai as genai
-                genai.configure(api_key=active_api_key)
-                
-                preferred_models = [
-                    'models/gemini-1.5-flash', 'gemini-1.5-flash',
-                    'models/gemini-2.0-flash', 'gemini-2.0-flash',
-                    'models/gemini-1.5-pro', 'gemini-1.5-pro'
-                ]
-                model_candidates = preferred_models + [m for m in available_gemini_models if m not in preferred_models]
-                results = analyze_batch_gemini(genai, model_candidates, downloaded_images, video_id)
-            except Exception:
-                pass
-
-        if not results:
-            results = analyze_frames_local_cv_1fps(downloaded_images, video_id)
-
-        progress_bar.progress(100)
-        status_text.text("✅ Scansione visiva 1 fps completata con successo!")
-
-        analysis_obj = {
-            "video_id": video_id,
-            "title": f"Video Amazon/Logistica ({video_id})",
-            "youtube_url": video_url,
-            "results": results,
-            "analyzed_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
-            "api_key_connected": api_status,
-            "scan_density": scan_density
-        }
-        st.session_state['current_analysis'] = analysis_obj
-
-        if not any(item['video_id'] == video_id for item in st.session_state['history']):
-            st.session_state['history'].append(analysis_obj)
-
-    # Rendering dei Risultati
-    current_data = st.session_state.get('current_analysis')
-    if current_data and current_data.get('results'):
-        results = current_data['results']
-        vid = current_data['video_id']
-
-        st.success(f"Trovati {len(results)} rilevamenti visivi nel video ID `{vid}` con densità `{current_data.get('scan_density', '1 fps')}`!")
-        
-        # Generazione Audit Report Tecnico Reale
-        audit_data = {
+        audit = {
             "storopack_vision_ai_audit": {
-                "generated_at": current_data.get("analyzed_at_utc"),
+                "generated_at": current.get("analyzed_at_utc"),
                 "video_metadata": {
                     "video_id": vid,
-                    "youtube_url": current_data.get("youtube_url"),
-                    "scan_density": current_data.get("scan_density")
+                    "youtube_url": current.get("youtube_url"),
+                    "model": current.get("model"),
+                    "sampling_fps": current.get("fps"),
                 },
-                "api_diagnostics": {
-                    "gemini_api_key_connected": current_data.get("api_key_connected", False),
-                    "engine_status": "VLM Multimodale Attivo" if current_data.get("api_key_connected") else "Computer Vision Locale Attiva"
-                },
-                "detection_findings": results
+                "api_diagnostics": current.get("diagnostics"),
+                "detection_findings": results,
             }
         }
-        json_report_str = json.dumps(audit_data, indent=2, ensure_ascii=False)
 
         st.download_button(
-            label="📥 Scarica Report Tecnico di Audit AI (JSON)",
-            data=json_report_str,
+            "📥 Scarica report di audit (JSON)",
+            data=json.dumps(audit, indent=2, ensure_ascii=False),
             file_name=f"storopack_audit_{vid}.json",
             mime="application/json",
-            help="Scarica il tracciato tecnico completo con stato API, esiti visivi e timestamp per audit."
         )
 
         st.divider()
 
         for item in results:
-            st.markdown(f"### ▶ {item['time']} - {item['title']}")
-            st.write(f"**Descrizione**: {item.get('description') or item.get('desc')}")
-            st.write(f"**Confidenza AI**: `{item['confidence']}`")
-            st.write(f"**Engine di Rilevamento**: `{item.get('engine_used', 'Gemini VLM / Computer Vision')}`")
-            st.markdown(f"[↗ Apri direttamente al secondo {item['seconds']} su YouTube](https://www.youtube.com/watch?v={vid}&t={item['seconds']}s)")
+            icon = "🎬" if item.get("action") else "👁️"
+            st.markdown(f"### {icon} {item.get('time', '??:??')} — {item.get('title', 'Materiale')}")
+            st.write(item.get("description", ""))
+            c1, c2 = st.columns(2)
+            c1.metric("Confidenza", item.get("confidence", "n/d"))
+            c2.metric("Categoria", item.get("category", "n/d"))
+            secs = item.get("seconds", 0)
+            st.markdown(
+                f"[↗ Apri il video al secondo {secs}]"
+                f"(https://www.youtube.com/watch?v={vid}&t={secs}s)"
+            )
             st.divider()
-    else:
-        st.info("Incolla un URL YouTube e clicca su **'Analizza Video'** per avviare la scansione dei materiali Storopack.")
+
+        with st.expander("🔧 Diagnostica tecnica della chiamata"):
+            st.json(current.get("diagnostics", {}))
+    elif not btn:
+        st.info("Inserisci un URL YouTube e avvia l'analisi.")
