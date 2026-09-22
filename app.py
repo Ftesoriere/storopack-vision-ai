@@ -2,6 +2,7 @@ import streamlit as st
 import re
 import json
 import time
+import threading
 from datetime import datetime
 
 st.set_page_config(
@@ -180,9 +181,15 @@ min_confidence = st.sidebar.slider(
     help="Abbassa il valore per far emergere anche i rilevamenti incerti."
 )
 
+st.sidebar.subheader("⏱️ Robustezza")
 retry_on_overload = st.sidebar.checkbox(
     "Riprova automaticamente se il modello è sovraccarico (503)",
     value=True
+)
+timeout_seconds = st.sidebar.slider(
+    "Timeout massimo complessivo (secondi)",
+    min_value=60, max_value=600, value=240, step=30,
+    help="Oltre questo tempo l'analisi si interrompe con un errore leggibile invece di restare appesa."
 )
 
 st.sidebar.header("🎯 Materiali da cercare")
@@ -197,7 +204,9 @@ targets = {
 st.sidebar.header("📜 Cronologia")
 if st.session_state['history']:
     for idx, h in enumerate(st.session_state['history']):
-        if st.sidebar.button(f"▶ {h['video_id']} ({len(h['results'])} esiti)", key=f"hist_{idx}"):
+        elapsed = h.get('elapsed_seconds')
+        suffix = f" · {elapsed}s" if elapsed else ""
+        if st.sidebar.button(f"▶ {h['video_id']} ({len(h['results'])} esiti{suffix})", key=f"hist_{idx}"):
             st.session_state['current_analysis'] = h
 else:
     st.sidebar.caption("Nessun video analizzato in questa sessione.")
@@ -292,8 +301,12 @@ Se non rilevi alcun materiale da imballaggio, rispondi con: []
 """
 
 
-def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps,
-                           fallback_models, retry_503=True):
+def run_analysis_worker(api_key, youtube_url, model_name, prompt, fps,
+                        fallback_models, retry_503, shared):
+    """
+    Esegue l'analisi in un thread separato, aggiornando 'shared' passo per passo
+    cosi che l'interfaccia possa mostrare lo stato in tempo reale.
+    """
     diag = {
         "sdk": "google-genai",
         "model_requested": model_name,
@@ -303,23 +316,27 @@ def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps,
         "raw_response_excerpt": None,
         "error": None,
     }
+    shared["diag"] = diag
 
     try:
         from google import genai
         from google.genai import types
     except ImportError as e:
         diag["error"] = f"SDK google-genai non disponibile: {e}"
-        return None, diag
+        shared["done"] = True
+        return
 
     try:
+        shared["status"] = "Inizializzazione del client Gemini…"
         client = genai.Client(api_key=api_key)
     except Exception as e:
         diag["error"] = f"Client non inizializzabile: {type(e).__name__}: {e}"
-        return None, diag
+        shared["done"] = True
+        return
 
     model_queue = [model_name] + [m for m in fallback_models if m != model_name]
 
-    def try_call(candidate, label, with_fps):
+    def try_call(candidate, with_fps):
         if with_fps:
             video_part = types.Part(
                 file_data=types.FileData(file_uri=youtube_url),
@@ -341,13 +358,21 @@ def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps,
             max_tries = 3 if retry_503 else 1
 
             for attempt_n in range(max_tries):
+                shared["status"] = (
+                    f"Modello {candidate} · strategia {label} · tentativo {attempt_n + 1}/{max_tries} — "
+                    f"Gemini sta elaborando il video…"
+                )
+                t_call = time.time()
                 try:
-                    text = try_call(candidate, label, with_fps)
+                    text = try_call(candidate, with_fps)
+                    call_s = round(time.time() - t_call, 1)
                     diag["attempts"].append({
                         "model": candidate, "strategy": label,
-                        "try": attempt_n + 1, "outcome": "risposta ricevuta"
+                        "try": attempt_n + 1, "seconds": call_s,
+                        "outcome": "risposta ricevuta"
                     })
                     diag["raw_response_excerpt"] = text[:1000]
+                    shared["status"] = f"Risposta ricevuta da {candidate} in {call_s}s · parsing…"
 
                     cleaned = re.sub(r'^```(?:json)?|```$', '', text, flags=re.MULTILINE).strip()
                     match = re.search(r'\[.*\]', cleaned, re.DOTALL)
@@ -357,24 +382,30 @@ def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps,
                             item["engine_used"] = f"Gemini nativo su URL YouTube ({candidate}, {label})"
                         diag["method"] = label
                         diag["model_used"] = candidate
-                        return parsed, diag
+                        shared["results"] = parsed
+                        shared["done"] = True
+                        return
 
                     diag["attempts"][-1]["outcome"] = "risposta senza array JSON"
                     break
 
                 except Exception as e:
+                    call_s = round(time.time() - t_call, 1)
                     err = f"{type(e).__name__}: {e}"
                     diag["attempts"].append({
                         "model": candidate, "strategy": label,
-                        "try": attempt_n + 1, "outcome": err
+                        "try": attempt_n + 1, "seconds": call_s, "outcome": err
                     })
 
                     if "404" in err or "NOT_FOUND" in err or "no longer available" in err:
+                        shared["status"] = f"{candidate} non disponibile · passo al modello successivo"
                         model_dead = True
                         break
 
                     if ("503" in err or "UNAVAILABLE" in err) and attempt_n < max_tries - 1:
-                        time.sleep(3 * (attempt_n + 1))
+                        wait = 3 * (attempt_n + 1)
+                        shared["status"] = f"{candidate} sovraccarico (503) · attendo {wait}s e riprovo…"
+                        time.sleep(wait)
                         continue
 
                     break
@@ -386,7 +417,7 @@ def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps,
             continue
 
     diag["error"] = "Nessun modello disponibile ha prodotto un risultato. Vedi 'attempts'."
-    return None, diag
+    shared["done"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -422,32 +453,89 @@ with col_right:
     if btn and video_id and active_api_key:
         clean_url = f"https://www.youtube.com/watch?v={video_id}"
         prompt = build_prompt(targets, fps_choice, exhaustive, min_confidence)
-
         mode_label = "esaustiva" if exhaustive else "solo azioni"
-        with st.spinner(f"Gemini sta guardando l'intero video a {fps_choice} fps (modalità {mode_label})…"):
-            results, diag = analyze_youtube_native(
-                active_api_key, clean_url, model_choice, prompt, fps_choice,
-                model_options, retry_on_overload
-            )
 
-        if results is None:
-            st.error("❌ Analisi non riuscita. Nessun risultato inventato — ecco il motivo tecnico:")
+        shared = {"status": "Avvio…", "results": None, "diag": None, "done": False}
+
+        worker = threading.Thread(
+            target=run_analysis_worker,
+            args=(active_api_key, clean_url, model_choice, prompt, fps_choice,
+                  model_options, retry_on_overload, shared),
+            daemon=True,
+        )
+
+        clock_box = st.empty()
+        status_box = st.empty()
+        bar = st.progress(0)
+
+        t_start = time.time()
+        worker.start()
+
+        timed_out = False
+        while not shared["done"]:
+            elapsed = time.time() - t_start
+            if elapsed > timeout_seconds:
+                timed_out = True
+                break
+
+            pct = min(int(elapsed / timeout_seconds * 100), 99)
+            bar.progress(pct)
+            clock_box.markdown(
+                f"### ⏱️ {int(elapsed)}s trascorsi "
+                f"<span style='font-size:14px;opacity:0.7'>/ limite {timeout_seconds}s</span>",
+                unsafe_allow_html=True,
+            )
+            status_box.info(f"🔄 {shared['status']}")
+            time.sleep(1)
+
+        total_elapsed = round(time.time() - t_start, 1)
+        bar.progress(100)
+        clock_box.empty()
+        status_box.empty()
+
+        diag = shared.get("diag") or {}
+        diag["elapsed_seconds"] = total_elapsed
+        diag["timeout_limit_seconds"] = timeout_seconds
+
+        if timed_out:
+            diag["error"] = (
+                f"TIMEOUT dopo {total_elapsed}s. L'analisi è stata interrotta dall'app "
+                f"per evitare il blocco della sessione. Ultimo stato: {shared['status']}"
+            )
+            st.error(
+                f"⏱️ **Timeout dopo {total_elapsed} secondi.** "
+                f"L'analisi è stata interrotta per non far cadere la connessione.\n\n"
+                f"Ultimo stato noto: *{shared['status']}*\n\n"
+                f"Cosa provare: alzare il timeout nella barra laterale, ridurre gli fps, "
+                f"oppure riprovare più tardi se il modello è sovraccarico."
+            )
             with st.expander("🔧 Diagnostica tecnica", expanded=True):
                 st.json(diag)
-        elif len(results) == 0:
-            st.warning("Gemini ha analizzato il video ma non ha rilevato materiale da imballaggio.")
+
+        elif shared["results"] is None:
+            st.error(f"❌ Analisi fallita dopo {total_elapsed}s. Motivo tecnico reale:")
+            with st.expander("🔧 Diagnostica tecnica", expanded=True):
+                st.json(diag)
+
+        elif len(shared["results"]) == 0:
+            st.warning(
+                f"Gemini ha analizzato il video in {total_elapsed}s "
+                f"ma non ha rilevato materiale da imballaggio."
+            )
             with st.expander("🔧 Diagnostica tecnica"):
                 st.json(diag)
+
         else:
             analysis_obj = {
                 "video_id": video_id,
                 "youtube_url": clean_url,
-                "results": results,
+                "results": shared["results"],
                 "diagnostics": diag,
                 "model": diag.get("model_used") or model_choice,
                 "fps": fps_choice,
                 "mode": mode_label,
                 "min_confidence": min_confidence,
+                "elapsed_seconds": total_elapsed,
                 "analyzed_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
             st.session_state['current_analysis'] = analysis_obj
@@ -462,16 +550,19 @@ with col_right:
 
         n_action = sum(1 for r in results if r.get("action"))
         n_passive = len(results) - n_action
+        elapsed = current.get('elapsed_seconds')
 
         st.success(
             f"✅ {len(results)} rilevamenti su `{vid}` "
             f"({n_action} azioni, {n_passive} presenze passive) — "
             f"modello `{current.get('model')}`, modalità `{current.get('mode', 'n/d')}`"
+            + (f" — completata in **{elapsed}s**" if elapsed else "")
         )
 
         audit = {
             "storopack_vision_ai_audit": {
                 "generated_at": current.get("analyzed_at_utc"),
+                "elapsed_seconds": current.get("elapsed_seconds"),
                 "video_metadata": {
                     "video_id": vid,
                     "youtube_url": current.get("youtube_url"),
