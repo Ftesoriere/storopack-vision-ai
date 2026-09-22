@@ -3,7 +3,7 @@ import re
 import json
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, date
 
 st.set_page_config(
     page_title="Storopack Vision AI Analyzer",
@@ -22,6 +22,8 @@ for key, default in [
     ('key_validation_msg', ""),
     ('available_models', []),
     ('autocheck_done', False),
+    ('usage_counter', {}),          # {"2026-09-22": {"gemini-3.6-flash": 7}}
+    ('quota_exhausted', {}),        # {"gemini-3.6-flash": "2026-09-22"}
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -41,6 +43,26 @@ CATEGORY_ICONS = {
     "PELASPAN": "⚪",
     "CARTONE": "📦",
 }
+
+TODAY = date.today().isoformat()
+
+
+def bump_usage(model):
+    day = st.session_state['usage_counter'].setdefault(TODAY, {})
+    day[model] = day.get(model, 0) + 1
+
+
+def usage_today(model):
+    return st.session_state['usage_counter'].get(TODAY, {}).get(model, 0)
+
+
+def mark_exhausted(model):
+    st.session_state['quota_exhausted'][model] = TODAY
+
+
+def is_exhausted(model):
+    return st.session_state['quota_exhausted'].get(model) == TODAY
+
 
 # ---------------------------------------------------------------------------
 # HEADER
@@ -158,12 +180,28 @@ st.sidebar.header("⚙️ Parametri di Analisi")
 detected = st.session_state.get('available_models', [])
 model_options = detected if detected else FALLBACK_MODELS
 
-if detected:
-    st.sidebar.caption(f"✅ Lista caricata dal tuo account ({len(detected)} modelli)")
-else:
-    st.sidebar.caption("⚠️ Lista di ripiego — verifica la chiave per caricare i modelli reali")
 
-model_choice = st.sidebar.selectbox("Modello Gemini:", model_options, index=0)
+def model_label(m):
+    used = usage_today(m)
+    if is_exhausted(m):
+        return f"{m}  ⛔ quota esaurita oggi"
+    if used:
+        return f"{m}  ({used} usi oggi)"
+    return m
+
+
+model_choice = st.sidebar.selectbox(
+    "Modello Gemini:",
+    model_options,
+    index=0,
+    format_func=model_label,
+)
+
+if is_exhausted(model_choice):
+    st.sidebar.error(
+        "⛔ Quota giornaliera esaurita per questo modello. "
+        "Scegline un altro o attendi il reset (mezzanotte Pacific Time)."
+    )
 
 fps_choice = st.sidebar.select_slider(
     "Campionamento (fps):",
@@ -194,10 +232,15 @@ retry_on_overload = st.sidebar.checkbox(
     "Riprova automaticamente se il modello è sovraccarico (503)",
     value=True
 )
+auto_fallback = st.sidebar.checkbox(
+    "Passa a un altro modello se la quota è esaurita (429)",
+    value=True,
+    help="Se disattivato, l'app si ferma subito segnalando la quota esaurita."
+)
 timeout_seconds = st.sidebar.slider(
     "Timeout massimo complessivo (secondi)",
-    min_value=60, max_value=600, value=240, step=30,
-    help="Oltre questo tempo l'analisi si interrompe con un errore leggibile invece di restare appesa."
+    min_value=60, max_value=900, value=420, step=30,
+    help="Un video di 4 minuti a 1 fps può richiedere 2-5 minuti. Alza il limite per video lunghi."
 )
 
 st.sidebar.subheader("📋 Visualizzazione risultati")
@@ -215,6 +258,17 @@ targets = {
     "PELASPAN": st.sidebar.checkbox("⚪ PELASPAN® (chip loose fill)", value=True),
     "CARTONE": st.sidebar.checkbox("📦 Scatole / nastro adesivo", value=True),
 }
+
+# ---- Contatore utilizzo ----
+st.sidebar.header("📊 Utilizzo di oggi")
+today_usage = st.session_state['usage_counter'].get(TODAY, {})
+if today_usage:
+    for m, n in sorted(today_usage.items(), key=lambda kv: -kv[1]):
+        flag = " ⛔" if is_exhausted(m) else ""
+        st.sidebar.caption(f"`{m}` · {n}/20 richieste{flag}")
+    st.sidebar.caption("_Free tier: 20 richieste/giorno per modello_")
+else:
+    st.sidebar.caption("Nessuna chiamata in questa sessione.")
 
 st.sidebar.header("📜 Cronologia")
 if st.session_state['history']:
@@ -240,6 +294,20 @@ def extract_youtube_id(url):
     if len(clean) == 11 and '/' not in clean:
         return clean
     return None
+
+
+def classify_error(err_text):
+    """Restituisce (tipo, dettaglio) per gestire l'errore in modo mirato."""
+    if "429" in err_text or "RESOURCE_EXHAUSTED" in err_text:
+        m = re.search(r"limit:\s*(\d+)", err_text)
+        limit = m.group(1) if m else "?"
+        per_day = "PerDay" in err_text or "free_tier_requests" in err_text
+        return "quota", {"limit": limit, "per_day": per_day}
+    if "404" in err_text or "NOT_FOUND" in err_text or "no longer available" in err_text:
+        return "model_dead", {}
+    if "503" in err_text or "UNAVAILABLE" in err_text:
+        return "overload", {}
+    return "other", {}
 
 
 def build_prompt(active_targets, fps, exhaustive_mode, min_conf):
@@ -318,19 +386,17 @@ Se non rilevi alcun materiale da imballaggio, rispondi con: []
 
 
 def run_analysis_worker(api_key, youtube_url, model_name, prompt, fps,
-                        fallback_models, retry_503, shared):
-    """
-    Esegue l'analisi in un thread separato, aggiornando 'shared' passo per passo
-    cosi che l'interfaccia possa mostrare lo stato in tempo reale.
-    """
+                        fallback_models, retry_503, allow_fallback, shared):
     diag = {
         "sdk": "google-genai",
         "model_requested": model_name,
         "model_used": None,
         "method": None,
         "attempts": [],
+        "models_quota_exhausted": [],
         "raw_response_excerpt": None,
         "error": None,
+        "error_type": None,
     }
     shared["diag"] = diag
 
@@ -339,6 +405,7 @@ def run_analysis_worker(api_key, youtube_url, model_name, prompt, fps,
         from google.genai import types
     except ImportError as e:
         diag["error"] = f"SDK google-genai non disponibile: {e}"
+        diag["error_type"] = "sdk"
         shared["done"] = True
         return
 
@@ -347,10 +414,14 @@ def run_analysis_worker(api_key, youtube_url, model_name, prompt, fps,
         client = genai.Client(api_key=api_key)
     except Exception as e:
         diag["error"] = f"Client non inizializzabile: {type(e).__name__}: {e}"
+        diag["error_type"] = "client"
         shared["done"] = True
         return
 
-    model_queue = [model_name] + [m for m in fallback_models if m != model_name]
+    if allow_fallback:
+        model_queue = [model_name] + [m for m in fallback_models if m != model_name]
+    else:
+        model_queue = [model_name]
 
     def try_call(candidate, with_fps):
         if with_fps:
@@ -360,24 +431,28 @@ def run_analysis_worker(api_key, youtube_url, model_name, prompt, fps,
             )
         else:
             video_part = types.Part(file_data=types.FileData(file_uri=youtube_url))
-
         response = client.models.generate_content(
             model=candidate,
             contents=types.Content(parts=[video_part, types.Part(text=prompt)]),
         )
         return (response.text or "").strip()
 
+    last_error_type = None
+
     for candidate in model_queue:
-        model_dead = False
+        skip_model = False
 
         for label, with_fps in [("con_fps", True), ("senza_fps", False)]:
             max_tries = 3 if retry_503 else 1
 
             for attempt_n in range(max_tries):
                 shared["status"] = (
-                    f"Modello {candidate} · strategia {label} · tentativo {attempt_n + 1}/{max_tries} — "
+                    f"{candidate} · {label} · tentativo {attempt_n + 1}/{max_tries} — "
                     f"Gemini sta elaborando il video…"
                 )
+                shared["calls_made"] = shared.get("calls_made", 0) + 1
+                shared.setdefault("models_called", set()).add(candidate)
+
                 t_call = time.time()
                 try:
                     text = try_call(candidate, with_fps)
@@ -388,7 +463,7 @@ def run_analysis_worker(api_key, youtube_url, model_name, prompt, fps,
                         "outcome": "risposta ricevuta"
                     })
                     diag["raw_response_excerpt"] = text[:1000]
-                    shared["status"] = f"Risposta ricevuta da {candidate} in {call_s}s · parsing…"
+                    shared["status"] = f"Risposta da {candidate} in {call_s}s · parsing…"
 
                     cleaned = re.sub(r'^```(?:json)?|```$', '', text, flags=re.MULTILINE).strip()
                     match = re.search(r'\[.*\]', cleaned, re.DOTALL)
@@ -408,31 +483,55 @@ def run_analysis_worker(api_key, youtube_url, model_name, prompt, fps,
                 except Exception as e:
                     call_s = round(time.time() - t_call, 1)
                     err = f"{type(e).__name__}: {e}"
+                    kind, info = classify_error(err)
+                    last_error_type = kind
+
                     diag["attempts"].append({
                         "model": candidate, "strategy": label,
-                        "try": attempt_n + 1, "seconds": call_s, "outcome": err
+                        "try": attempt_n + 1, "seconds": call_s,
+                        "error_type": kind, "outcome": err[:400]
                     })
 
-                    if "404" in err or "NOT_FOUND" in err or "no longer available" in err:
-                        shared["status"] = f"{candidate} non disponibile · passo al modello successivo"
-                        model_dead = True
+                    if kind == "quota":
+                        # Quota giornaliera per modello: inutile riprovare o
+                        # cambiare strategia sullo stesso modello.
+                        diag["models_quota_exhausted"].append(candidate)
+                        shared.setdefault("exhausted", set()).add(candidate)
+                        shared["status"] = (
+                            f"⛔ {candidate}: quota esaurita (limite {info.get('limit')}/giorno) · "
+                            f"{'provo un altro modello' if allow_fallback else 'stop'}"
+                        )
+                        skip_model = True
                         break
 
-                    if ("503" in err or "UNAVAILABLE" in err) and attempt_n < max_tries - 1:
+                    if kind == "model_dead":
+                        shared["status"] = f"{candidate} non disponibile · passo al successivo"
+                        skip_model = True
+                        break
+
+                    if kind == "overload" and attempt_n < max_tries - 1:
                         wait = 3 * (attempt_n + 1)
-                        shared["status"] = f"{candidate} sovraccarico (503) · attendo {wait}s e riprovo…"
+                        shared["status"] = f"{candidate} sovraccarico (503) · attendo {wait}s…"
                         time.sleep(wait)
                         continue
 
                     break
 
-            if model_dead:
+            if skip_model:
                 break
 
-        if model_dead:
+        if skip_model:
             continue
 
-    diag["error"] = "Nessun modello disponibile ha prodotto un risultato. Vedi 'attempts'."
+    if diag["models_quota_exhausted"]:
+        diag["error_type"] = "quota"
+        diag["error"] = (
+            "Quota giornaliera del free tier esaurita per: "
+            + ", ".join(sorted(set(diag["models_quota_exhausted"])))
+        )
+    else:
+        diag["error_type"] = last_error_type or "unknown"
+        diag["error"] = "Nessun modello disponibile ha prodotto un risultato. Vedi 'attempts'."
     shared["done"] = True
 
 
@@ -471,12 +570,15 @@ with col_right:
         prompt = build_prompt(targets, fps_choice, exhaustive, min_confidence)
         mode_label = "esaustiva" if exhaustive else "solo azioni"
 
-        shared = {"status": "Avvio…", "results": None, "diag": None, "done": False}
+        shared = {
+            "status": "Avvio…", "results": None, "diag": None, "done": False,
+            "calls_made": 0, "models_called": set(), "exhausted": set(),
+        }
 
         worker = threading.Thread(
             target=run_analysis_worker,
             args=(active_api_key, clean_url, model_choice, prompt, fps_choice,
-                  model_options, retry_on_overload, shared),
+                  model_options, retry_on_overload, auto_fallback, shared),
             daemon=True,
         )
 
@@ -493,12 +595,8 @@ with col_right:
             if elapsed > timeout_seconds:
                 timed_out = True
                 break
-
-            pct = min(int(elapsed / timeout_seconds * 100), 99)
-            bar.progress(pct)
-            clock_box.markdown(
-                f"**⏱️ {int(elapsed)}s** trascorsi / limite {timeout_seconds}s"
-            )
+            bar.progress(min(int(elapsed / timeout_seconds * 100), 99))
+            clock_box.markdown(f"**⏱️ {int(elapsed)}s** / limite {timeout_seconds}s")
             status_box.caption(f"🔄 {shared['status']}")
             time.sleep(1)
 
@@ -507,20 +605,41 @@ with col_right:
         clock_box.empty()
         status_box.empty()
 
+        # Aggiorna contatori di utilizzo
+        for m in shared.get("models_called", set()):
+            bump_usage(m)
+        for m in shared.get("exhausted", set()):
+            mark_exhausted(m)
+
         diag = shared.get("diag") or {}
         diag["elapsed_seconds"] = total_elapsed
         diag["timeout_limit_seconds"] = timeout_seconds
 
         if timed_out:
+            diag["error_type"] = "timeout"
             diag["error"] = (
-                f"TIMEOUT dopo {total_elapsed}s. L'analisi è stata interrotta dall'app "
-                f"per evitare il blocco della sessione. Ultimo stato: {shared['status']}"
+                f"TIMEOUT dopo {total_elapsed}s. Ultimo stato: {shared['status']}"
             )
-            st.error(
-                f"⏱️ **Timeout dopo {total_elapsed} secondi.** "
-                f"Ultimo stato: *{shared['status']}*"
+            st.error(f"⏱️ **Timeout dopo {total_elapsed}s** — {shared['status']}")
+            st.caption(
+                "Il modello stava ancora elaborando. Alza il timeout nella barra laterale "
+                "(un video di 4 minuti a 1 fps può richiedere 3-5 minuti) oppure riduci gli fps."
             )
             with st.expander("🔧 Diagnostica tecnica", expanded=True):
+                st.json(diag)
+
+        elif diag.get("error_type") == "quota":
+            exhausted = sorted(set(diag.get("models_quota_exhausted", [])))
+            st.error(f"⛔ **Quota giornaliera esaurita** — {', '.join(exhausted)}")
+            st.markdown(
+                "Il piano gratuito consente **20 richieste al giorno per modello**.\n\n"
+                "**Opzioni:**\n"
+                "1. Seleziona un altro modello dalla barra laterale (quota separata per modello)\n"
+                "2. Attendi il reset giornaliero (mezzanotte Pacific Time, ~09:00 ora italiana)\n"
+                "3. [Attiva la fatturazione](https://aistudio.google.com/apikey) — "
+                "un video di 4 minuti costa circa 0,20 $"
+            )
+            with st.expander("🔧 Diagnostica tecnica"):
                 st.json(diag)
 
         elif shared["results"] is None:
@@ -529,9 +648,7 @@ with col_right:
                 st.json(diag)
 
         elif len(shared["results"]) == 0:
-            st.warning(
-                f"Nessun materiale da imballaggio rilevato (analisi completata in {total_elapsed}s)."
-            )
+            st.warning(f"Nessun materiale rilevato (analisi completata in {total_elapsed}s).")
             with st.expander("🔧 Diagnostica tecnica"):
                 st.json(diag)
 
@@ -570,7 +687,6 @@ with col_right:
             f"{', '.join(cats)} · `{current.get('model')}` · {elapsed}s"
         )
 
-        # ---- Elenco compatto (default) ----
         if view_mode == "Elenco compatto":
             lines = []
             for r in results:
@@ -583,10 +699,7 @@ with col_right:
                 pos = r.get("position", "")
                 pos_txt = f" · _{pos}_" if pos else ""
                 link = f"https://www.youtube.com/watch?v={vid}&t={secs}s"
-                lines.append(
-                    f"- {icon}{marker} **[{t}]({link})** — {title} "
-                    f"`{conf}%`{pos_txt}"
-                )
+                lines.append(f"- {icon}{marker} **[{t}]({link})** — {title} `{conf}%`{pos_txt}")
             st.markdown("\n".join(lines))
 
             with st.expander("Descrizioni estese"):
@@ -597,7 +710,6 @@ with col_right:
                         unsafe_allow_html=True,
                     )
 
-        # ---- Tabella ----
         elif view_mode == "Tabella":
             rows = [{
                 "Tempo": r.get("time", ""),
@@ -608,15 +720,13 @@ with col_right:
                 "Azione": "Sì" if r.get("action") else "",
             } for r in results]
             st.dataframe(rows, use_container_width=True, hide_index=True)
-
-            st.caption("Link diretti ai momenti:")
             links = " · ".join(
                 f"[{r.get('time')}](https://www.youtube.com/watch?v={vid}&t={r.get('seconds',0)}s)"
                 for r in results
             )
+            st.caption("Link diretti:")
             st.markdown(links)
 
-        # ---- Schede dettagliate ----
         else:
             for r in results:
                 icon = CATEGORY_ICONS.get(r.get("category", ""), "•")
