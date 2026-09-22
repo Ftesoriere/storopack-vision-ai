@@ -3,3 +3,5 @@ requests
 pillow
 numpy
 google-genai
+pandas
+openpyxl
