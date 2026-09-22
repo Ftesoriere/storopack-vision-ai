@@ -19,9 +19,20 @@ for key, default in [
     ('key_validated', False),
     ('key_validation_msg', ""),
     ('available_models', []),
+    ('autocheck_done', False),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+# Modelli di ripiego se la lista live non è ancora stata caricata.
+# Ordine: dal più recente al più vecchio.
+FALLBACK_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.6-pro",
+    "gemini-3.5-flash",
+    "gemini-3.0-flash",
+    "gemini-2.0-flash",
+]
 
 # ---------------------------------------------------------------------------
 # HEADER
@@ -34,6 +45,44 @@ st.markdown("""
         </p>
     </div>
 """, unsafe_allow_html=True)
+
+
+# ---------------------------------------------------------------------------
+# VALIDAZIONE CHIAVE
+# ---------------------------------------------------------------------------
+def validate_key_live(api_key):
+    """Interroga l'endpoint Gemini e restituisce i modelli realmente disponibili."""
+    try:
+        from google import genai
+    except ImportError as e:
+        return False, f"SDK google-genai non installato: {e}", []
+
+    try:
+        client = genai.Client(api_key=api_key)
+        models = []
+        for m in client.models.list():
+            name = getattr(m, "name", "") or ""
+            short = name.replace("models/", "")
+            if not short:
+                continue
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            # Scarta embedding, imagen, veo, tts: non servono per l'analisi video
+            if any(x in short for x in ("embedding", "imagen", "veo", "tts", "aqa")):
+                continue
+            models.append(short)
+
+        if models:
+            # Ordina: più recenti prima
+            models.sort(key=lambda s: (
+                "3.6" not in s, "3.5" not in s, "flash" not in s, s
+            ))
+            return True, f"Connessione riuscita — {len(models)} modelli disponibili", models
+        return False, "Connessione riuscita ma nessun modello generativo compatibile", []
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", []
+
 
 # ---------------------------------------------------------------------------
 # SIDEBAR - API KEY
@@ -48,55 +97,41 @@ except Exception:
     pass
 
 input_key = st.sidebar.text_input(
-    "API Key (formato AQ. oppure AIza):",
+    "API Key:",
     value=default_key,
     type="password",
-    help="Le chiavi create oggi su AI Studio iniziano con 'AQ.'. Le vecchie 'AIza' sono state dismesse da Google a settembre 2026."
+    help="Le chiavi create su AI Studio nel 2026 iniziano con 'AQ.'. Le vecchie 'AIza' sono state dismesse da Google a settembre 2026."
 )
 
 if input_key and input_key.strip() != st.session_state['saved_api_key']:
     st.session_state['saved_api_key'] = input_key.strip()
     st.session_state['key_validated'] = False
     st.session_state['available_models'] = []
+    st.session_state['autocheck_done'] = False
 
 active_api_key = st.session_state.get('saved_api_key', '')
 
-# Riconoscimento del tipo di chiave (informativo, NON bloccante)
 if active_api_key.startswith("AQ."):
-    key_type = "Auth key (formato attuale Google 2026)"
+    key_type = "Auth key — formato attuale Google 2026 ✔"
 elif active_api_key.startswith("AIza"):
-    key_type = "Standard key (formato legacy, dismesso da Google)"
+    key_type = "Standard key — formato legacy, dismesso da Google"
 elif active_api_key:
     key_type = "Formato non riconosciuto"
 else:
     key_type = None
 
-
-def validate_key_live(api_key):
-    """Verifica reale della chiave interrogando l'endpoint Gemini."""
-    try:
-        from google import genai
-    except ImportError as e:
-        return False, f"SDK google-genai non installato: {e}", []
-
-    try:
-        client = genai.Client(api_key=api_key)
-        models = []
-        for m in client.models.list():
-            name = getattr(m, "name", "")
-            actions = getattr(m, "supported_actions", None) or []
-            if not actions or "generateContent" in actions:
-                models.append(name)
-        if models:
-            return True, f"Connessione riuscita — {len(models)} modelli disponibili", models
-        return False, "Connessione riuscita ma nessun modello generativo disponibile", []
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}", []
-
+# Verifica automatica al primo caricamento della chiave
+if active_api_key and not st.session_state['autocheck_done']:
+    with st.spinner("Verifica automatica della chiave…"):
+        ok, msg, models = validate_key_live(active_api_key)
+    st.session_state['key_validated'] = ok
+    st.session_state['key_validation_msg'] = msg
+    st.session_state['available_models'] = models
+    st.session_state['autocheck_done'] = True
 
 if active_api_key:
-    st.sidebar.caption(f"Tipo rilevato: {key_type}")
-    if st.sidebar.button("🔍 Verifica connessione", use_container_width=True):
+    st.sidebar.caption(f"Tipo: {key_type}")
+    if st.sidebar.button("🔄 Riverifica connessione", use_container_width=True):
         with st.spinner("Verifica in corso…"):
             ok, msg, models = validate_key_live(active_api_key)
         st.session_state['key_validated'] = ok
@@ -107,8 +142,6 @@ if active_api_key:
         st.sidebar.success(f"🟢 {st.session_state['key_validation_msg']}")
     elif st.session_state['key_validation_msg']:
         st.sidebar.error(f"🔴 {st.session_state['key_validation_msg']}")
-    else:
-        st.sidebar.info("Chiave salvata. Clicca su *Verifica connessione* per testarla.")
 else:
     st.sidebar.warning("🔴 Nessuna API Key inserita.")
     st.sidebar.markdown("👉 [Genera la chiave su AI Studio](https://aistudio.google.com/apikey)")
@@ -121,18 +154,14 @@ st.sidebar.divider()
 st.sidebar.header("⚙️ Parametri di Analisi")
 
 detected = st.session_state.get('available_models', [])
-model_options = [m.replace("models/", "") for m in detected] if detected else [
-    "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro"
-]
-preferred = next(
-    (m for m in model_options if "flash" in m and ("2.5" in m or "3." in m)),
-    model_options[0]
-)
-model_choice = st.sidebar.selectbox(
-    "Modello Gemini:",
-    model_options,
-    index=model_options.index(preferred) if preferred in model_options else 0,
-)
+model_options = detected if detected else FALLBACK_MODELS
+
+if detected:
+    st.sidebar.caption(f"✅ Lista caricata dal tuo account ({len(detected)} modelli)")
+else:
+    st.sidebar.caption("⚠️ Lista di ripiego — verifica la chiave per caricare i modelli reali")
+
+model_choice = st.sidebar.selectbox("Modello Gemini:", model_options, index=0)
 
 fps_choice = st.sidebar.select_slider(
     "Campionamento (fps):",
@@ -157,6 +186,7 @@ if st.session_state['history']:
             st.session_state['current_analysis'] = h
 else:
     st.sidebar.caption("Nessun video analizzato in questa sessione.")
+
 
 # ---------------------------------------------------------------------------
 # UTILITY
@@ -217,14 +247,16 @@ Se non rilevi alcun materiale da imballaggio, rispondi con: []
 """
 
 
-def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps):
+def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps, fallback_models):
     """
-    Passa l'URL YouTube direttamente a Gemini: il video viene elaborato
-    sui server Google, senza download locale.
+    Passa l'URL YouTube direttamente a Gemini: il video è elaborato sui server
+    Google, senza download locale. Se il modello scelto non è disponibile,
+    ripiega automaticamente sugli altri modelli noti.
     """
     diag = {
         "sdk": "google-genai",
-        "model": model_name,
+        "model_requested": model_name,
+        "model_used": None,
         "method": None,
         "attempts": [],
         "raw_response_excerpt": None,
@@ -244,45 +276,59 @@ def analyze_youtube_native(api_key, youtube_url, model_name, prompt, fps):
         diag["error"] = f"Client non inizializzabile: {type(e).__name__}: {e}"
         return None, diag
 
-    # Tentativo 1: con controllo fps
-    # Tentativo 2: senza video_metadata (alcuni modelli non la accettano)
-    strategies = [
-        ("con_fps", lambda: types.Part(
-            file_data=types.FileData(file_uri=youtube_url),
-            video_metadata=types.VideoMetadata(fps=fps),
-        )),
-        ("senza_fps", lambda: types.Part(
-            file_data=types.FileData(file_uri=youtube_url)
-        )),
-    ]
+    # Coda modelli: quello scelto, poi i fallback non ancora provati
+    model_queue = [model_name] + [m for m in fallback_models if m != model_name]
 
-    for label, part_builder in strategies:
-        try:
-            video_part = part_builder()
-            response = client.models.generate_content(
-                model=model_name,
-                contents=types.Content(parts=[video_part, types.Part(text=prompt)]),
-            )
-            text = (response.text or "").strip()
-            diag["attempts"].append({"strategy": label, "outcome": "risposta ricevuta"})
-            diag["raw_response_excerpt"] = text[:800]
+    for candidate in model_queue:
+        strategies = [
+            ("con_fps", lambda: types.Part(
+                file_data=types.FileData(file_uri=youtube_url),
+                video_metadata=types.VideoMetadata(fps=fps),
+            )),
+            ("senza_fps", lambda: types.Part(
+                file_data=types.FileData(file_uri=youtube_url)
+            )),
+        ]
 
-            match = re.search(r'\[.*\]', text, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group(0))
-                for item in parsed:
-                    item["engine_used"] = f"Gemini nativo su URL YouTube ({model_name}, {label})"
-                diag["method"] = label
-                return parsed, diag
+        model_unavailable = False
 
-            diag["attempts"][-1]["outcome"] = "nessun JSON nella risposta"
-        except Exception as e:
-            diag["attempts"].append({
-                "strategy": label,
-                "outcome": f"{type(e).__name__}: {e}"
-            })
+        for label, part_builder in strategies:
+            try:
+                video_part = part_builder()
+                response = client.models.generate_content(
+                    model=candidate,
+                    contents=types.Content(parts=[video_part, types.Part(text=prompt)]),
+                )
+                text = (response.text or "").strip()
+                diag["attempts"].append({
+                    "model": candidate, "strategy": label, "outcome": "risposta ricevuta"
+                })
+                diag["raw_response_excerpt"] = text[:800]
 
-    diag["error"] = "Tutte le strategie hanno fallito. Vedi 'attempts' per il dettaglio."
+                match = re.search(r'\[.*\]', text, re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group(0))
+                    for item in parsed:
+                        item["engine_used"] = f"Gemini nativo su URL YouTube ({candidate}, {label})"
+                    diag["method"] = label
+                    diag["model_used"] = candidate
+                    return parsed, diag
+
+                diag["attempts"][-1]["outcome"] = "risposta senza array JSON"
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+                diag["attempts"].append({
+                    "model": candidate, "strategy": label, "outcome": err
+                })
+                # Se il modello non esiste, inutile provare l'altra strategia
+                if "404" in err or "NOT_FOUND" in err or "no longer available" in err:
+                    model_unavailable = True
+                    break
+
+        if model_unavailable:
+            continue
+
+    diag["error"] = "Nessun modello disponibile ha prodotto un risultato. Vedi 'attempts'."
     return None, diag
 
 
@@ -322,11 +368,12 @@ with col_right:
 
         with st.spinner(f"Gemini sta guardando l'intero video a {fps_choice} fps… (30-90 s)"):
             results, diag = analyze_youtube_native(
-                active_api_key, clean_url, model_choice, prompt, fps_choice
+                active_api_key, clean_url, model_choice, prompt, fps_choice,
+                model_options
             )
 
         if results is None:
-            st.error("❌ Analisi non riuscita. Nessun risultato inventato — ecco il motivo tecnico reale:")
+            st.error("❌ Analisi non riuscita. Nessun risultato inventato — ecco il motivo tecnico:")
             with st.expander("🔧 Diagnostica tecnica", expanded=True):
                 st.json(diag)
         elif len(results) == 0:
@@ -339,7 +386,7 @@ with col_right:
                 "youtube_url": clean_url,
                 "results": results,
                 "diagnostics": diag,
-                "model": model_choice,
+                "model": diag.get("model_used") or model_choice,
                 "fps": fps_choice,
                 "analyzed_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
             }
