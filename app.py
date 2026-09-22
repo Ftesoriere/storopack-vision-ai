@@ -34,6 +34,14 @@ FALLBACK_MODELS = [
     "gemini-2.0-flash",
 ]
 
+CATEGORY_ICONS = {
+    "PAPERplus": "🟤",
+    "AIRplus": "🎈",
+    "FOAMplus": "🔲",
+    "PELASPAN": "⚪",
+    "CARTONE": "📦",
+}
+
 # ---------------------------------------------------------------------------
 # HEADER
 # ---------------------------------------------------------------------------
@@ -192,6 +200,13 @@ timeout_seconds = st.sidebar.slider(
     help="Oltre questo tempo l'analisi si interrompe con un errore leggibile invece di restare appesa."
 )
 
+st.sidebar.subheader("📋 Visualizzazione risultati")
+view_mode = st.sidebar.radio(
+    "Formato:",
+    ["Elenco compatto", "Tabella", "Schede dettagliate"],
+    index=0,
+)
+
 st.sidebar.header("🎯 Materiali da cercare")
 targets = {
     "PAPERplus": st.sidebar.checkbox("🟤 PAPERplus® / PAPERwrap (carta)", value=True),
@@ -279,6 +294,7 @@ REGOLE GENERALI
   rispetto a un materiale presente ma taciuto.
 - Se lo stesso materiale compare in momenti distinti e separati del video, riporta
   ciascuna occorrenza.
+- Il campo "title" deve essere BREVE: massimo 6 parole, senza punto finale.
 - Nel campo "position" indica dove si trova nell'inquadratura (es. "in basso a sinistra",
   "centro", "sfondo destro", "primo piano").
 
@@ -289,7 +305,7 @@ Rispondi ESCLUSIVAMENTE con un array JSON valido, nessun testo prima o dopo, nes
   {{
     "time": "00:21",
     "seconds": 21,
-    "title": "Fascio di carta Kraft sul piano di lavoro",
+    "title": "Fascio di carta Kraft su banco",
     "description": "Un ammasso di carta Kraft marrone accartocciata è appoggiato sul tavolo, parzialmente tagliato dal bordo inferiore sinistro dell'inquadratura.",
     "confidence": "72%",
     "category": "PAPERplus",
@@ -481,15 +497,13 @@ with col_right:
             pct = min(int(elapsed / timeout_seconds * 100), 99)
             bar.progress(pct)
             clock_box.markdown(
-                f"### ⏱️ {int(elapsed)}s trascorsi "
-                f"<span style='font-size:14px;opacity:0.7'>/ limite {timeout_seconds}s</span>",
-                unsafe_allow_html=True,
+                f"**⏱️ {int(elapsed)}s** trascorsi / limite {timeout_seconds}s"
             )
-            status_box.info(f"🔄 {shared['status']}")
+            status_box.caption(f"🔄 {shared['status']}")
             time.sleep(1)
 
         total_elapsed = round(time.time() - t_start, 1)
-        bar.progress(100)
+        bar.empty()
         clock_box.empty()
         status_box.empty()
 
@@ -504,23 +518,19 @@ with col_right:
             )
             st.error(
                 f"⏱️ **Timeout dopo {total_elapsed} secondi.** "
-                f"L'analisi è stata interrotta per non far cadere la connessione.\n\n"
-                f"Ultimo stato noto: *{shared['status']}*\n\n"
-                f"Cosa provare: alzare il timeout nella barra laterale, ridurre gli fps, "
-                f"oppure riprovare più tardi se il modello è sovraccarico."
+                f"Ultimo stato: *{shared['status']}*"
             )
             with st.expander("🔧 Diagnostica tecnica", expanded=True):
                 st.json(diag)
 
         elif shared["results"] is None:
-            st.error(f"❌ Analisi fallita dopo {total_elapsed}s. Motivo tecnico reale:")
+            st.error(f"❌ Analisi fallita dopo {total_elapsed}s.")
             with st.expander("🔧 Diagnostica tecnica", expanded=True):
                 st.json(diag)
 
         elif len(shared["results"]) == 0:
             st.warning(
-                f"Gemini ha analizzato il video in {total_elapsed}s "
-                f"ma non ha rilevato materiale da imballaggio."
+                f"Nessun materiale da imballaggio rilevato (analisi completata in {total_elapsed}s)."
             )
             with st.expander("🔧 Diagnostica tecnica"):
                 st.json(diag)
@@ -543,21 +553,90 @@ with col_right:
                 h for h in st.session_state['history'] if h['video_id'] != video_id
             ] + [analysis_obj]
 
+    # -----------------------------------------------------------------------
+    # RENDER RISULTATI
+    # -----------------------------------------------------------------------
     current = st.session_state.get('current_analysis')
     if current and current.get('results'):
-        results = current['results']
+        results = sorted(current['results'], key=lambda r: r.get('seconds', 0))
         vid = current['video_id']
 
         n_action = sum(1 for r in results if r.get("action"))
-        n_passive = len(results) - n_action
         elapsed = current.get('elapsed_seconds')
+        cats = sorted({r.get('category', '?') for r in results})
 
-        st.success(
-            f"✅ {len(results)} rilevamenti su `{vid}` "
-            f"({n_action} azioni, {n_passive} presenze passive) — "
-            f"modello `{current.get('model')}`, modalità `{current.get('mode', 'n/d')}`"
-            + (f" — completata in **{elapsed}s**" if elapsed else "")
+        st.caption(
+            f"**{len(results)} rilevamenti** · {n_action} azioni · "
+            f"{', '.join(cats)} · `{current.get('model')}` · {elapsed}s"
         )
+
+        # ---- Elenco compatto (default) ----
+        if view_mode == "Elenco compatto":
+            lines = []
+            for r in results:
+                icon = CATEGORY_ICONS.get(r.get("category", ""), "•")
+                marker = "🎬" if r.get("action") else ""
+                t = r.get("time", "??:??")
+                secs = r.get("seconds", 0)
+                conf = str(r.get("confidence", "")).replace("%", "")
+                title = r.get("title", "Materiale")
+                pos = r.get("position", "")
+                pos_txt = f" · _{pos}_" if pos else ""
+                link = f"https://www.youtube.com/watch?v={vid}&t={secs}s"
+                lines.append(
+                    f"- {icon}{marker} **[{t}]({link})** — {title} "
+                    f"`{conf}%`{pos_txt}"
+                )
+            st.markdown("\n".join(lines))
+
+            with st.expander("Descrizioni estese"):
+                for r in results:
+                    st.markdown(
+                        f"**{r.get('time')}** — {r.get('title')}  \n"
+                        f"<span style='font-size:13px;opacity:0.8'>{r.get('description','')}</span>",
+                        unsafe_allow_html=True,
+                    )
+
+        # ---- Tabella ----
+        elif view_mode == "Tabella":
+            rows = [{
+                "Tempo": r.get("time", ""),
+                "Categoria": r.get("category", ""),
+                "Materiale": r.get("title", ""),
+                "Conf.": r.get("confidence", ""),
+                "Posizione": r.get("position", ""),
+                "Azione": "Sì" if r.get("action") else "",
+            } for r in results]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+            st.caption("Link diretti ai momenti:")
+            links = " · ".join(
+                f"[{r.get('time')}](https://www.youtube.com/watch?v={vid}&t={r.get('seconds',0)}s)"
+                for r in results
+            )
+            st.markdown(links)
+
+        # ---- Schede dettagliate ----
+        else:
+            for r in results:
+                icon = CATEGORY_ICONS.get(r.get("category", ""), "•")
+                marker = " 🎬" if r.get("action") else ""
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{icon} {r.get('time','??:??')} — {r.get('title','Materiale')}**{marker} "
+                        f"`{r.get('confidence','n/d')}`"
+                    )
+                    st.caption(r.get("description", ""))
+                    meta = []
+                    if r.get("category"):
+                        meta.append(r["category"])
+                    if r.get("position"):
+                        meta.append(r["position"])
+                    secs = r.get("seconds", 0)
+                    meta.append(f"[▶ vai al {r.get('time')}](https://www.youtube.com/watch?v={vid}&t={secs}s)")
+                    st.caption(" · ".join(meta))
+
+        st.divider()
 
         audit = {
             "storopack_vision_ai_audit": {
@@ -576,34 +655,31 @@ with col_right:
             }
         }
 
-        st.download_button(
-            "📥 Scarica report di audit (JSON)",
+        dl1, dl2 = st.columns(2)
+        dl1.download_button(
+            "📥 Report JSON",
             data=json.dumps(audit, indent=2, ensure_ascii=False),
             file_name=f"storopack_audit_{vid}.json",
             mime="application/json",
             use_container_width=True,
         )
-
-        st.divider()
-
-        for item in results:
-            icon = "🎬" if item.get("action") else "👁️"
-            st.markdown(f"### {icon} {item.get('time', '??:??')} — {item.get('title', 'Materiale')}")
-            st.write(item.get("description", ""))
-            if item.get("position"):
-                st.caption(f"📍 Posizione nell'inquadratura: {item['position']}")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Confidenza", item.get("confidence", "n/d"))
-            c2.metric("Categoria", item.get("category", "n/d"))
-            c3.metric("Tipo", "Azione" if item.get("action") else "Presenza")
-            secs = item.get("seconds", 0)
-            st.markdown(
-                f"[↗ Apri il video al secondo {secs}]"
-                f"(https://www.youtube.com/watch?v={vid}&t={secs}s)"
+        csv_lines = ["tempo,secondi,categoria,materiale,confidenza,posizione,azione"]
+        for r in results:
+            csv_lines.append(
+                f"\"{r.get('time','')}\",{r.get('seconds',0)},"
+                f"\"{r.get('category','')}\",\"{r.get('title','')}\","
+                f"\"{r.get('confidence','')}\",\"{r.get('position','')}\","
+                f"{'si' if r.get('action') else 'no'}"
             )
-            st.divider()
+        dl2.download_button(
+            "📊 Report CSV",
+            data="\n".join(csv_lines),
+            file_name=f"storopack_audit_{vid}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
 
-        with st.expander("🔧 Diagnostica tecnica della chiamata"):
+        with st.expander("🔧 Diagnostica tecnica"):
             st.json(current.get("diagnostics", {}))
     elif not btn:
         st.info("Inserisci un URL YouTube e avvia l'analisi.")
