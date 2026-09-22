@@ -2,4 +2,4 @@ streamlit
 requests
 pillow
 numpy
-google-generativeai
+google-genai
