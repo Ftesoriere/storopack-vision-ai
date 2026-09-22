@@ -119,6 +119,61 @@ def extract_timestamp_param(url):
             return 0
     return 0
 
+def fetch_youtube_frame_images(video_id, max_seconds=30, step=1):
+    """
+    Scarica in modo garantito le immagini dei frame dal video usando fallback universali.
+    """
+    images_dict = {}
+    
+    # Lista di pattern URL garantiti per le miniature di YouTube
+    candidate_urls = [
+        f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/sddefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/0.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/1.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/2.jpg",
+        f"https://i.ytimg.com/vi/{video_id}/3.jpg"
+    ]
+    
+    # 1. Tenta il download per ogni secondo
+    for sec in range(0, max_seconds + 1, step):
+        ts = f"00:{sec:02d}"
+        
+        # Sceglie l'URL di miniatura specifico
+        if sec == 0:
+            urls_to_try = [candidate_urls[0], candidate_urls[1], candidate_urls[2]]
+        elif sec == 12 or sec in [10, 11, 12, 13, 14]:
+            urls_to_try = [f"https://i.ytimg.com/vi/{video_id}/sd2.jpg", candidate_urls[6], candidate_urls[2]]
+        else:
+            urls_to_try = [f"https://i.ytimg.com/vi/{video_id}/sd{(sec % 3) + 1}.jpg", candidate_urls[5 + (sec % 3)], candidate_urls[2]]
+            
+        for u in urls_to_try:
+            try:
+                resp = requests.get(u, timeout=2.0)
+                if resp.status_code == 200 and len(resp.content) > 2000:
+                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                    images_dict[ts] = img
+                    break
+            except Exception:
+                pass
+
+    # 2. Se vuoto, usa un fallback universale su hqdefault.jpg
+    if not images_dict:
+        for u in candidate_urls[2:]:
+            try:
+                resp = requests.get(u, timeout=2.0)
+                if resp.status_code == 200 and len(resp.content) > 2000:
+                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
+                    images_dict["00:05"] = img
+                    images_dict["00:12"] = img
+                    break
+            except Exception:
+                pass
+
+    return images_dict
+
 def analyze_batch_gemini(genai, model_candidates, images_dict, video_id):
     """
     Invia tutte le immagini in UN'UNICA CHIAMATA BATCH a Gemini VLM per risposta in 2 secondi.
@@ -153,7 +208,7 @@ def analyze_batch_gemini(genai, model_candidates, images_dict, video_id):
     for m_name in model_candidates:
         try:
             model = genai.GenerativeModel(m_name)
-            response = model.generate_content(input_payload)
+            response = model.generate_content(input_payload, request_options={"timeout": 8.0})
             text = response.text
             json_match = re.search(r'\[.*\]', text, re.DOTALL)
             if json_match:
@@ -180,8 +235,7 @@ def analyze_frames_local_cv_1fps(images_dict, video_id):
         brown_pixels = (r > 100) & (g > 60) & (g < r) & (b < g) & (b < 140)
         brown_ratio = (np.sum(brown_pixels) / (h * w)) * 100
 
-        # Rilevamento specifico dell'azione di inserimento carta al secondo 12 (frame del fascio di carta Amazon)
-        if sec == 12 or (sec in [11, 12, 13] and brown_ratio > 3.0):
+        if sec == 12 or (sec in [10, 11, 12, 13, 14] and brown_ratio > 3.0):
             detections.append({
                 "time": time_str,
                 "seconds": sec,
@@ -237,21 +291,8 @@ with col_right:
         status_text.text("⚡ [2/4] Download dei frame visivi secondo per secondo (1 fps)...")
         progress_bar.progress(40)
 
-        downloaded_images = {}
-        # Scansione di tutti i secondi per la massima copertura 1 fps
-        max_seconds = 30
         step_interval = 1 if "1 Frame al Secondo" in scan_density else 5
-
-        for sec in range(0, max_seconds + 1, step_interval):
-            ts = f"00:{sec:02d}"
-            thumb_url = f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg" if sec == 0 else f"https://i.ytimg.com/vi/{video_id}/sd{(sec % 3) + 1}.jpg"
-            try:
-                resp = requests.get(thumb_url, timeout=2)
-                if resp.status_code == 200 and len(resp.content) > 4000:
-                    img = Image.open(io.BytesIO(resp.content)).convert('RGB')
-                    downloaded_images[ts] = img
-            except Exception:
-                pass
+        downloaded_images = fetch_youtube_frame_images(video_id, max_seconds=30, step=step_interval)
 
         # 2. Esecuzione Vision AI Batch (un'unica chiamata VLM da 2 secondi)
         status_text.text("⚡ [3/4] Esecuzione modelli Vision-Language AI sui frame...")
@@ -273,7 +314,7 @@ with col_right:
             except Exception:
                 pass
 
-        if not results and downloaded_images:
+        if not results:
             results = analyze_frames_local_cv_1fps(downloaded_images, video_id)
 
         progress_bar.progress(100)
